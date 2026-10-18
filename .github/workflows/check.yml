@@ -1,0 +1,14 @@
+# The plugin's files parse and the CLI starts.
+name: check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --check plugin/bin/simsites && for f in plugin/runner/*.mjs; do node --check "$f"; done
+      - run: node -e 'for (const f of [".claude-plugin/marketplace.json", "plugin/.claude-plugin/plugin.json", "plugin/hooks/hooks.json"]) JSON.parse(require("fs").readFileSync(f, "utf8"))'
+      - run: node plugin/bin/simsites help

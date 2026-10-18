@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Create a task and complete one</title>
+  <link rel="stylesheet" href="../../style/tokens.css" />
+  <link rel="stylesheet" href="../../style/components.css" />
+  <style>
+    .app { position: absolute; inset: 0; display: flex; }
+    .sidebar { width: 248px; padding: 24px 18px; border-right: 1px solid var(--line); background: var(--surface); }
+    .sidebar .logo { margin: 4px 8px 30px; }
+    .side-item { display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 12px; border-radius: var(--radius-sm);
+      font: 500 14px/1 var(--font); color: var(--ink-2); }
+    .side-item.is-active { background: var(--surface-2); color: var(--ink); }
+    .side-item b { margin-left: auto; font-weight: 600; font-size: 12px; color: var(--ink-3); }
+    .main { flex: 1; padding: 40px 56px; position: relative; }
+    .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+    .head h1 { margin: 0; font: 700 32px/1 var(--font-display); letter-spacing: -0.025em; }
+    .head .meta { margin-top: 10px; color: var(--ink-3); font: 500 14px/1 var(--font); }
+    .composer { padding: 18px; margin-bottom: 18px; overflow: hidden; }
+    .composer .row { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
+    .composer .row .spacer { flex: 1; }
+    .list { overflow: hidden; }
+    .task.is-new { background: var(--brand-soft); }
+    .toast-wrap { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <span class="logo"><span class="logo-mark"></span>Tidy</span>
+      <div class="side-item is-active">Today <b data-sim="count-today">3</b></div>
+      <div class="side-item">Upcoming <b>8</b></div>
+      <div class="side-item">Projects</div>
+      <div class="side-item">Team</div>
+    </aside>
+    <main class="main">
+      <div class="head">
+        <div>
+          <h1>Today</h1>
+          <div class="meta" data-sim="today-meta">3 open · 0 done</div>
+        </div>
+        <span class="btn btn-primary" data-sim="new-task-btn">+ New task</span>
+      </div>
+
+      <div class="composer card" data-sim="composer">
+        <div class="input" data-sim="task-title"><span class="value"></span></div>
+        <div class="row">
+          <span class="chip" data-sim="due-today">Today</span>
+          <span class="chip" data-sim="due-tomorrow">Tomorrow</span>
+          <span class="chip">Pick date</span>
+          <span class="spacer"></span>
+          <span class="btn" data-sim="cancel-task">Cancel</span>
+          <span class="btn btn-primary" data-sim="save-task">Save task</span>
+        </div>
+      </div>
+
+      <div class="list card">
+        <div class="task is-new" data-sim="task-new">
+          <span class="check"></span><span class="task-title">Prepare launch checklist</span><span class="task-due">Tomorrow</span>
+        </div>
+        <div class="task" data-sim="task-1">
+          <span class="check" data-sim="task-check-1"></span><span class="task-title">Review onboarding copy</span><span class="task-due">Today</span>
+        </div>
+        <div class="task" data-sim="task-2">
+          <span class="check" data-sim="task-check-2"></span><span class="task-title">Send invoices to Northwind</span><span class="task-due">Today</span>
+        </div>
+        <div class="task" data-sim="task-3">
+          <span class="check" data-sim="task-check-3"></span><span class="task-title">Book design review</span><span class="task-due">Today</span>
+        </div>
+      </div>
+
+      <div class="toast-wrap"><div class="toast" data-sim="toast-created"><span class="toast-dot"></span>Task created</div></div>
+    </main>
+  </div>
+
+  <script src="/runtime/sim.js"></script>
+  <script>
+    const TITLE = 'Prepare launch checklist';
+
+    Sim.define({
+      title: 'Create a task and complete one',
+      duration: 12,
+      viewport: [1440, 900],
+      steps: [
+        { t: 1.5, do: 'click', target: 'new-task-btn', note: 'Opens the task composer' },
+        { t: 2.5, do: 'type', target: 'task-title', value: TITLE, note: 'Names the task' },
+        { t: 5.2, do: 'click', target: 'due-tomorrow', note: 'Sets it due tomorrow' },
+        { t: 6.5, do: 'click', target: 'save-task', note: 'Saves the task' },
+        { t: 7.2, do: 'expect', target: 'toast-created', note: 'Sees confirmation' },
+        { t: 9.0, do: 'click', target: 'task-check-2', note: 'Completes an existing task' },
+        { t: 10.0, do: 'expect', target: 'task-new', note: 'New task is at the top of the list' },
+      ],
+      render(t, h) {
+        // Composer opens under the header, closes after saving.
+        const open = h.prog(t, 1.6, 2.1, 'out');
+        const close = h.prog(t, 6.6, 7.0, 'inOut');
+        const composerH = 132 * open * (1 - close);
+        h.set('composer', {
+          height: `${composerH}px`,
+          marginBottom: `${18 * open * (1 - close)}px`,
+          padding: composerH < 1 ? '0px' : '18px',
+          borderWidth: composerH < 1 ? '0px' : '1px',
+          opacity: open * (1 - close),
+        });
+
+        const title = h.typed(TITLE, t, 2.6, 4.6);
+        h.$('task-title').classList.toggle('is-focused', h.between(t, 2.2, 6.5));
+        h.$('task-title').querySelector('.value').innerHTML =
+          title || '<span class="placeholder">What needs doing?</span>';
+        h.$('due-today').classList.toggle('is-active', t < 5.2);
+        h.$('due-tomorrow').classList.toggle('is-active', t >= 5.2);
+
+        // New task slides into the list.
+        const added = h.prog(t, 6.6, 7.1, 'out');
+        h.set('task-new', { height: `${60 * added}px`, opacity: added, borderBottomWidth: added > 0 ? '1px' : '0px' });
+        h.set('task-new', { background: `color-mix(in srgb, var(--brand-soft) ${Math.round(100 * (1 - h.prog(t, 8.0, 9.0)))}%, var(--surface))` });
+
+        // Toast
+        const toast = h.prog(t, 6.9, 7.3, 'out') * (1 - h.prog(t, 9.4, 9.8));
+        h.set('toast-created', { opacity: toast, transform: `translateY(${(1 - toast) * 16}px)` });
+
+        // Complete task 2
+        const done = t >= 9.0;
+        h.$('task-check-2').classList.toggle('is-checked', done);
+        h.$('task-2').classList.toggle('is-done', done);
+
+        const open_ = (t >= 6.6 ? 4 : 3) - (done ? 1 : 0);
+        h.text('today-meta', `${open_} open · ${done ? 1 : 0} done`);
+        h.text('count-today', String(open_));
+      },
+    });
+  </script>
+</body>
+</html>

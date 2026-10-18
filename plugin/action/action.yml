@@ -1,0 +1,59 @@
+# SimSites verify, in CI: replay a repo's approved sims against the app and report to SimSites with the commit, which is
+# what turns a pull request's SimSites check green (docs/integrations-plan.md). Use it as
+#   uses: yannickErp/simsites-plugin/plugin/action@main
+# against the PR's preview deploy (dev-url) or an app the job starts (start). Examples: docs/ci.md.
+name: SimSites verify
+description: Replay the approved sims against your app and report the result to SimSites, for the pull request's SimSites check.
+branding:
+  icon: play-circle
+  color: blue
+inputs:
+  token:
+    description: A SimSites token (Settings → CLI tokens), as a secret.
+    required: true
+  dev-url:
+    description: Where the app runs, e.g. the preview deploy's URL. Default — the devUrl in .simsites/config.json.
+    required: false
+  start:
+    description: A command that starts the app in the job (e.g. "npm run dev"), when there's no preview deploy.
+    required: false
+  sha:
+    description: The commit being verified. Default — the pull request's head commit.
+    required: false
+  url:
+    description: The SimSites to report to.
+    required: false
+    default: https://simsites.vercel.app
+  working-directory:
+    description: The repo's folder.
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: Browser for the replay
+      shell: bash
+      run: npx --yes playwright@1.63.0 install --with-deps chromium
+    - name: Start the app
+      if: inputs.start != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        (${{ inputs.start }}) > "$RUNNER_TEMP/simsites-app.log" 2>&1 &
+        url="${{ inputs.dev-url }}"
+        [ -z "$url" ] && url=$(node -e 'console.log(require("./.simsites/config.json").devUrl)')
+        for i in $(seq 1 120); do curl -sf -o /dev/null "$url" && exit 0; sleep 1; done
+        echo "The app didn't answer at $url within 2 minutes:"; tail -50 "$RUNNER_TEMP/simsites-app.log"; exit 1
+    - name: Verify
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SIMSITES_TOKEN: ${{ inputs.token }}
+        SIMSITES_URL: ${{ inputs.url }}
+        SIMSITES_SHA: ${{ inputs.sha || github.event.pull_request.head.sha || github.event.deployment.sha || github.sha }}
+        SIMSITES_BRANCH: ${{ github.head_ref || github.ref_name }}
+        SIMSITES_NO_OPEN: "1"
+      run: node "$GITHUB_ACTION_PATH/../bin/simsites" verify --all ${{ inputs.dev-url != '' && format('--dev-url "{0}"', inputs.dev-url) || '' }}

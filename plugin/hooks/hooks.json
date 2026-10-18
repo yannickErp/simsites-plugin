@@ -1,0 +1,39 @@
+{
+  "description": "SimSites: at session start, features still in flight; at each message, comments and approvals made in the Studio since the last one; and no blocking approval questions while the watch page is the place to approve.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/simsites\" hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/simsites\" hook session",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/simsites\" hook ask",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

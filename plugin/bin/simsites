@@ -1,0 +1,2040 @@
+#!/usr/bin/env node
+// simsites — use SimSites from any repo: simulate a feature first, then let Claude Code build it.
+// No dependencies (Node 18+). Talks to the hosted SimSites over HTTP; captures your app and verifies the build here,
+// with Playwright (installed into ~/.simsites/runner the first time it's needed).
+
+import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { homedir, hostname } from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const HOME_DIR = path.join(homedir(), ".simsites");
+const HOME_CONFIG = path.join(HOME_DIR, "config.json");
+
+// ---- args ------------------------------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+const flags = {};
+const SWITCHES = new Set(["json", "all", "drafts", "watch", "help", "replace", "term", "video", "no-open", "gif", "phone", "labels", "watch-only"]);
+const pos = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith("--")) {
+    const [k, v] = a.slice(2).split("=");
+    if (v !== undefined) flags[k] = v;
+    // On/off flags never take a value: `simsites design --json "the feature"` keeps the feature as an argument.
+    else if (!SWITCHES.has(k) && argv[i + 1] && !argv[i + 1].startsWith("--")) flags[k] = argv[++i];
+    else flags[k] = true;
+  } else pos.push(a);
+}
+const cmd = pos.shift() || "help";
+const JSON_OUT = !!flags.json;
+
+// ---- output ----------------------------------------------------------------------------------
+
+const c = process.stdout.isTTY && !process.env.NO_COLOR
+  ? { dim: (s) => `\x1b[2m${s}\x1b[0m`, bold: (s) => `\x1b[1m${s}\x1b[0m`, green: (s) => `\x1b[32m${s}\x1b[0m`, red: (s) => `\x1b[31m${s}\x1b[0m`, yellow: (s) => `\x1b[33m${s}\x1b[0m`, blue: (s) => `\x1b[34m${s}\x1b[0m` }
+  : { dim: (s) => s, bold: (s) => s, green: (s) => s, red: (s) => s, yellow: (s) => s, blue: (s) => s };
+const out = (s = "") => process.stdout.write(s + "\n");
+/** Progress for long waits: on stderr, so `--json` stdout stays parseable and Claude Code still sees it. */
+const progress = (s) => process.stderr.write(`${new Date().toTimeString().slice(0, 8)} ${s}\n`);
+function fail(msg, code = 1) {
+  if (JSON_OUT) out(JSON.stringify({ error: msg }));
+  else process.stderr.write(c.red("✗ ") + msg + "\n");
+  reportRun(false, msg);
+  process.exit(code);
+}
+
+/*
+ * How the CLI does on people's computers: each command's outcome (and the error, when it failed) goes to SimSites,
+ * which logs it to Sentry (docs/observability.md). Sent by a detached process, so it never slows a command down or
+ * keeps it alive. Only to a hosted SimSites this computer is signed in to; never file contents or code.
+ * SIMSITES_TELEMETRY=0 turns it off.
+ */
+const STARTED = Date.now();
+const QUIET_COMMANDS = new Set(["hook", "help", "version", "auth"]);
+let reported = false;
+function reportRun(ok, error) {
+  if (reported || QUIET_COMMANDS.has(cmd) || process.env.SIMSITES_TELEMETRY === "0") return;
+  reported = true;
+  try {
+    const token = studioToken();
+    // A local Studio (http://localhost, developing SimSites) isn't told, unless SIMSITES_TELEMETRY=1 (the tests).
+    if (!token || (!/^https:\/\//.test(studioUrl()) && process.env.SIMSITES_TELEMETRY !== "1")) return;
+    let engine = false;
+    try {
+      engine = !!engineReady; // not yet declared when a command fails while the CLI starts
+    } catch {}
+    const event = {
+      command: cmd,
+      ok,
+      ms: Date.now() - STARTED,
+      ...(error ? { error: String(error).slice(0, 1000) } : {}),
+      version: readJson(path.join(PLUGIN_DIR, ".claude-plugin", "plugin.json"), {}).version ?? null,
+      os: process.platform,
+      arch: process.arch,
+      node: process.version,
+      engine,
+      feature: flags.project || repoConfig()?.current || null,
+    };
+    const script = `fetch(process.env.U,{method:"POST",headers:{"content-type":"application/json",authorization:"Bearer "+process.env.T},body:process.env.E,signal:AbortSignal.timeout(8000)}).catch(()=>{})`;
+    spawn(process.execPath, ["-e", script], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, U: `${studioUrl()}/api/cli/event`, T: token, E: JSON.stringify(event) },
+    }).unref();
+  } catch {}
+}
+
+// ---- config ----------------------------------------------------------------------------------
+
+const readJson = (f, fb) => {
+  try {
+    return JSON.parse(readFileSync(f, "utf8"));
+  } catch {
+    return fb;
+  }
+};
+const homeConfig = () => readJson(HOME_CONFIG, {});
+function saveHome(patch) {
+  mkdirSync(HOME_DIR, { recursive: true });
+  writeFileSync(HOME_CONFIG, JSON.stringify({ ...homeConfig(), ...patch }, null, 2) + "\n");
+}
+/** The hosted SimSites. SIMSITES_URL or `simsites auth --url` point the CLI elsewhere (a test or development server). */
+const DEFAULT_URL = "https://simsites.vercel.app";
+const studioUrl = () => (process.env.SIMSITES_URL || homeConfig().studioUrl || DEFAULT_URL).replace(/\/+$/, "");
+const PLUGIN_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+/*
+ * Plugin skills always show as /<plugin>:<skill> (here /simsites:simsites). A personal skill isn't prefixed, so this
+ * one gives people a plain /simsites that hands over to the plugin's skill. Written by `auth` and `setup`; a skill of
+ * that name the person wrote themselves is left alone.
+ */
+const SHORTCUT_MARK = "<!-- simsites shortcut -->";
+function installShortcut() {
+  const file = path.join(homedir(), ".claude", "skills", "simsites", "SKILL.md");
+  if (existsSync(file) && !readFileSync(file, "utf8").includes(SHORTCUT_MARK)) return false;
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(
+    file,
+    `---
+name: simsites
+description: SimSites — design a UI feature as short simulations of the app before building it (shortcut for /simsites:simsites).
+argument-hint: <the feature you want, in plain words>
+disable-model-invocation: true
+---
+${SHORTCUT_MARK}
+Use the Skill tool to run the \`simsites:simsites\` skill with these arguments, then follow it: $ARGUMENTS
+`,
+  );
+  return true;
+}
+
+// The token for a hosted SimSites (`simsites auth <token>`), per Studio URL; a local Studio needs none.
+const CREDENTIALS = path.join(HOME_DIR, "credentials.json");
+const studioToken = () => process.env.SIMSITES_TOKEN || readJson(CREDENTIALS, {})[studioUrl()] || null;
+/** fetch to the Studio, with the token when there is one. */
+function studioFetch(p, init = {}) {
+  const token = studioToken();
+  return fetch(studioUrl() + p, { ...init, headers: { ...(init.headers ?? {}), ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+}
+
+function repoRoot() {
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch {
+    return process.cwd();
+  }
+}
+const ROOT = flags.repo ? path.resolve(String(flags.repo)) : repoRoot();
+const REPO_CONFIG = path.join(ROOT, ".simsites", "config.json");
+const repoConfig = () => readJson(REPO_CONFIG, null);
+function saveRepo(patch) {
+  mkdirSync(path.dirname(REPO_CONFIG), { recursive: true });
+  writeFileSync(REPO_CONFIG, JSON.stringify({ ...(repoConfig() ?? {}), ...patch }, null, 2) + "\n");
+}
+function currentProject() {
+  const p = flags.project || repoConfig()?.current;
+  if (!p) fail("No feature yet in this repo. Start one with /simsites in Claude Code (simsites design \"<what you want to build>\").");
+  return String(p);
+}
+
+// ---- http ------------------------------------------------------------------------------------
+
+// ---- the engine: browser work on this machine, when the hosted SimSites has no render worker ----------------------
+// It says so in /api/health ("cli-engine"). Then the requests below run here: the Studio's own route handlers, bundled
+// in ../engine/engine.mjs, on the repo's design folder. Before, the feature's state comes from SimSites (approvals and
+// comments happen on its watch page); after, what changed goes back (GET/POST /api/projects/<id>/engine, lib/sync.ts).
+const ENGINE_DIR = path.join(PLUGIN_DIR, "engine");
+const ENGINE_LOCAL = new Set(["look", "undo", "gif", "zoom", "labels"]);
+const FEATURE_ID = "([a-z0-9][a-z0-9-]{0,63})";
+
+async function usesEngine() {
+  return !!(await health())?.features?.includes("cli-engine");
+}
+
+/** Which requests the engine runs here: rendering, checking, drawing on scenes, the hand-off. */
+function engineRequest(method, p, body) {
+  const u = new URL(p, "http://x");
+  let m = u.pathname.match(new RegExp(`^/api/projects/${FEATURE_ID}/console$`));
+  if (m && method === "POST" && ENGINE_LOCAL.has(body?.action)) return m[1];
+  m = u.pathname.match(new RegExp(`^/api/projects/${FEATURE_ID}/sims/[a-z0-9][a-z0-9-]{0,63}/(check|ansi)$`));
+  if (m && method === "GET") return m[1];
+  m = u.pathname.match(new RegExp(`^/api/projects/${FEATURE_ID}/handoff$`));
+  if (m && method === "POST") return m[1];
+  return null;
+}
+
+let engineReady;
+function loadEngine(workspace) {
+  engineReady ??= (async () => {
+    globalThis.__simsitesPlaywright = await loadPlaywright();
+    // The engine always runs locally: on the design folder, never on a database.
+    process.env.SIMSITES_WORKSPACE = workspace;
+    process.env.SIMSITES_RUNTIME = path.join(ENGINE_DIR, "sim.js");
+    for (const k of ["DATABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY", "SUPABASE_SECRET_KEY"]) delete process.env[k];
+    const engine = await import(pathToFileURL(path.join(ENGINE_DIR, "engine.mjs")).href);
+    const server = await engine.serve(path.join(ENGINE_DIR, "sim.js"));
+    // Where the engine's browser loads scenes from (lib/scene-url.ts); SIMSITES_URL stays the hosted SimSites.
+    process.env.SIMSITES_ENGINE_URL = server.url;
+    return { engine, server };
+  })();
+  return engineReady;
+}
+
+const ENGINE_DOCS = ["plan.json", "decisions.json", "build-progress.json", "references/capture.json", "coverage-scan.json", "coverage-decisions.json", "fixes.json", "verify/report.json"];
+const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const readLines = (f) => (existsSync(f) ? readFileSync(f, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+const writeJsonFile = (f, v) => {
+  mkdirSync(path.dirname(f), { recursive: true });
+  writeFileSync(f, JSON.stringify(v, null, 2) + "\n");
+};
+
+/** The design folder's files SimSites keeps (scenes, looks, references, style), with their sizes. */
+function engineFiles(dir) {
+  const found = {};
+  for (const rel of walkFiles(dir))
+    if (/^(sims|references|style)\/|^[\w.-]+\.(md|html|css)$/.test(rel) && !rel.split("/").some((part) => part.startsWith(".")) && !/^sims\/[^/]+\/(meta\.json|chat\.jsonl)$/.test(rel) && !ENGINE_DOCS.includes(rel) && rel !== "brief.md")
+      found[rel] = statSync(path.join(dir, rel)).size;
+  return found;
+}
+
+/** Before the engine runs: SimSites' state into the design folder (the feature, approvals, comments, history, documents). */
+function pullState(dir, state) {
+  // The feature as a local Studio knows it, with this repo as its repo (the hand-off is written into it).
+  writeJsonFile(path.join(dir, "project.json"), { ...state.project, repo: { ...(state.project.repo ?? {}), path: ROOT, devUrl: repoConfig()?.devUrl ?? state.project.repo?.devUrl ?? "" } });
+  if (state.brief) writeFileSync(path.join(dir, "brief.md"), state.brief);
+  if (!existsSync(path.join(dir, "usecases.json")) && state.useCases.length) writeJsonFile(path.join(dir, "usecases.json"), state.useCases);
+  for (const uc of state.useCases) {
+    const sim = path.join(dir, "sims", uc.id);
+    if (state.metas[uc.id]) writeJsonFile(path.join(sim, "meta.json"), state.metas[uc.id]);
+    const chat = state.chats[uc.id] ?? [];
+    mkdirSync(sim, { recursive: true });
+    writeFileSync(path.join(sim, "chat.jsonl"), chat.map((e) => JSON.stringify(e)).join("\n") + (chat.length ? "\n" : ""));
+  }
+  writeJsonFile(path.join(dir, "inbox.json"), state.inbox);
+  for (const [name, value] of Object.entries(state.docs)) writeJsonFile(path.join(dir, name), value);
+}
+
+/** After: only what this run changed, so a comment or an approval made meanwhile on the watch page stays. */
+async function pushState(p, dir, state) {
+  const useCases = readJson(path.join(dir, "usecases.json"), []);
+  const ids = useCases.map((u) => u.id);
+  const body = { scenes: ids.filter((id) => existsSync(path.join(dir, "sims", id, "scene.html"))), metas: {}, chat: {}, inboxClosed: [], docs: {} };
+  const hosted = Object.fromEntries(state.useCases.map((u) => [u.id, u]));
+  if (useCases.length && (useCases.length !== state.useCases.length || useCases.some((u) => !sameJson({ ...hosted[u.id], ...u }, hosted[u.id])))) body.useCases = useCases;
+  for (const id of ids) {
+    const meta = readJson(path.join(dir, "sims", id, "meta.json"), null);
+    const before = state.metas[id] ?? {};
+    if (meta)
+      for (const k of ["status", "versions", "approvedBy", "takes", "keptTake", "error"])
+        if (k in meta && !sameJson(meta[k], before[k])) (body.metas[id] ??= {})[k] = meta[k];
+    const added = readLines(path.join(dir, "sims", id, "chat.jsonl")).slice((state.chats[id] ?? []).length);
+    if (added.length) body.chat[id] = added;
+  }
+  const wasOpen = new Set(state.inbox.filter((i) => i.status === "open").map((i) => i.id));
+  for (const i of readJson(path.join(dir, "inbox.json"), [])) if (i.status === "done" && wasOpen.has(i.id)) body.inboxClosed.push({ id: i.id, reply: i.reply ?? null });
+  for (const name of ENGINE_DOCS) {
+    const f = path.join(dir, name);
+    const v = existsSync(f) ? readJson(f, null) : null;
+    if (!sameJson(v, state.docs[name])) body.docs[name] = v;
+  }
+  // Files: what changed goes up, then SimSites hears what this run deleted.
+  const local = engineFiles(dir);
+  for (const [rel, size] of Object.entries(local)) {
+    if (size > 4 * 1024 * 1024) continue;
+    const buf = readFileSync(path.join(dir, rel));
+    if (state.files[rel] !== sha1(buf)) await upload(p, rel, buf);
+  }
+  body.removedFiles = Object.keys(state.files).filter((rel) => /^(sims|references|style)\//.test(rel) && !(rel in local));
+  const r = await studioFetch(`/api/projects/${p}/engine`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) });
+  if (!r.ok) fail(`Saving to ${studioUrl()} failed: ${(await r.json().catch(() => ({}))).error ?? `HTTP ${r.status}`}.`);
+}
+
+/** One request through the engine: pull, run here, push. Answers like the server would. */
+async function viaEngine(method, p, body, project) {
+  const dir = designDirOf(project);
+  mkdirSync(dir, { recursive: true });
+  const st = await studioFetch(`/api/projects/${project}/engine`, { signal: AbortSignal.timeout(60000) });
+  if (st.status === 401) fail(`Not signed in to ${studioUrl()}. Make a token in ${studioUrl()}/settings, then: simsites auth <token>`);
+  if (!st.ok) fail(`Couldn't read ${project} from ${studioUrl()}: ${(await st.json().catch(() => ({}))).error ?? `HTTP ${st.status}`}`);
+  const state = await st.json();
+  pullState(dir, state);
+  const { engine, server } = await loadEngine(path.dirname(dir));
+  const res = await engine.handle(method, p, body);
+  // Links the engine built point at its own local server: show SimSites' instead.
+  const text = (await res.text()).split(server.url).join(studioUrl());
+  if (res.ok) await pushState(project, dir, state);
+  return new Response(text, { status: res.status, headers: { "content-type": "application/json" } });
+}
+
+/** studioFetch, except for the browser work SimSites hands to this machine. */
+async function apiFetch(method, p, body, init) {
+  const project = engineRequest(method, p, body);
+  if (project && (await usesEngine()))
+    // Not a network error: say what failed here instead of "SimSites isn't reachable".
+    return viaEngine(method, p, body, project).catch((err) => fail(`Rendering on this machine failed: ${err?.stack || err}`));
+  return studioFetch(p, init);
+}
+
+async function api(method, p, body, { timeoutMs = 30000, soft = false } = {}) {
+  if (soft) {
+    // Returns { error } instead of exiting, for loops that must report partial progress.
+    try {
+      const res = await apiFetch(method, p, body, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) });
+      const data = await res.json().catch(() => ({}));
+      return res.ok ? data : { error: data.error || `HTTP ${res.status}` };
+    } catch (err) {
+      return { error: err?.name === "TimeoutError" ? "the Studio did not answer in time" : "the Studio is not reachable" };
+    }
+  }
+  let res;
+  try {
+    res = await apiFetch(method, p, body, {
+      method,
+      headers: body ? { "content-type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    if (err?.name === "TimeoutError") fail(`SimSites Studio did not answer in time (${p})`);
+    fail(`SimSites isn't reachable at ${studioUrl()}. Check your connection (or SIMSITES_URL).`);
+  }
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { error: text.slice(0, 300) };
+  }
+  if (res.status === 401)
+    fail(`${data.error || "Not signed in."} Make a token in ${studioUrl()}/settings, then: simsites auth <token>`);
+  if (!res.ok) fail(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+async function studioUp() {
+  try {
+    const r = await studioFetch("/api/projects", { signal: AbortSignal.timeout(4000) });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+let healthCache;
+/** What the SimSites this CLI talks to says about itself (null when it doesn't answer). */
+async function health() {
+  if (healthCache === undefined)
+    healthCache = await studioFetch("/api/health", { signal: AbortSignal.timeout(8000) })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+  return healthCache;
+}
+
+/**
+ * The hosted SimSites — the product: features live there, and this CLI keeps each feature's design folder in step
+ * with it. (A Studio without cloud storage, for developing SimSites itself, reads the folder directly.)
+ */
+async function isHosted() {
+  return !!(await health())?.hosted;
+}
+
+/** Before starting work: SimSites answers, and this computer is signed in to it. */
+async function ensureStudio() {
+  const h = await health();
+  if (!h) fail(`SimSites isn't reachable at ${studioUrl()}. Check your connection (or SIMSITES_URL).`);
+  if (!h.features?.includes("repo-0.5")) fail(`The SimSites at ${studioUrl()} is older than this plugin. Update it, or point the CLI at another one (simsites auth <token> --url …).`);
+  if (h.hosted && !studioToken()) fail(`Sign in to SimSites first: make a token at ${studioUrl()}/settings, then run: simsites auth <token>`);
+}
+
+// ---- git: what links a feature to its repo, branch and commits on GitHub -------------------------------------------
+
+function git(...args) {
+  try {
+    return execFileSync("git", args, { cwd: ROOT, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The repo's remote and branch, and the commit verify replays: in CI, SIMSITES_SHA (a pull request's head commit —
+ * GITHUB_SHA is the merge commit there). "dirty": changes to the app not committed yet (.simsites/ doesn't count).
+ */
+function gitInfo() {
+  const status = git("status", "--porcelain", "--untracked-files=no", "--", ".", ":(exclude).simsites");
+  return {
+    remote: git("remote", "get-url", "origin"),
+    branch: process.env.SIMSITES_BRANCH || git("branch", "--show-current") || null,
+    sha: process.env.SIMSITES_SHA || git("rev-parse", "HEAD"),
+    dirty: process.env.SIMSITES_SHA ? false : status === null ? false : status.length > 0,
+  };
+}
+
+// ---- the design folder on SimSites ---------------------------------------------------------------------------------
+
+const designDirOf = (p) => path.join(ROOT, ".simsites", "design", p);
+const sha1 = (buf) => createHash("sha1").update(buf).digest("hex");
+
+/**
+ * Files of the design folder that live on SimSites: scenes and takes, style, the app's screenshots and notes. Not
+ * what look writes (look/, history/ — they come down after a look), nor this CLI's own state.
+ */
+const SYNCED = (rel) =>
+  /^(sims\/[a-z0-9][a-z0-9-]*\/[^/]+|style\/.+|references\/[^/]+|[\w.-]+\.(html|css))$/.test(rel) &&
+  !rel.split("/").some((part) => part.startsWith(".")) &&
+  !/^sims\/[^/]+\/(looked\.html|meta\.json|chat\.jsonl)$/.test(rel) &&
+  rel !== "references/capture.json";
+
+function walkFiles(dir, base = "") {
+  const out = [];
+  let entries = [];
+  try {
+    entries = readdirSync(path.join(dir, base), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const rel = base ? `${base}/${e.name}` : e.name;
+    if (e.isDirectory()) out.push(...walkFiles(dir, rel));
+    else if (e.isFile()) out.push(rel);
+  }
+  return out;
+}
+
+const encodeRel = (rel) => rel.split("/").map(encodeURIComponent).join("/");
+
+/** A feature file from SimSites (null when it isn't there). */
+async function download(p, rel) {
+  const res = await studioFetch(`/ws/${p}/${encodeRel(rel)}`, { signal: AbortSignal.timeout(60000) }).catch(() => null);
+  return res?.ok ? Buffer.from(await res.arrayBuffer()) : null;
+}
+
+async function upload(p, rel, body) {
+  const res = await studioFetch(`/api/projects/${p}/files/${encodeRel(rel)}`, { method: "PUT", body, signal: AbortSignal.timeout(60000) }).catch((err) => ({
+    ok: false,
+    status: 0,
+    json: async () => ({ error: String(err) }),
+  }));
+  if (!res.ok) fail(`Uploading ${rel} failed: ${(await res.json().catch(() => ({}))).error ?? `HTTP ${res.status}`}`);
+}
+
+/**
+ * Bring the design folder and the feature on SimSites in step, both ways: a file changed here goes up, a file changed
+ * there (an undo, a take kept on the watch page) comes down. When both changed, this folder wins — Claude is editing
+ * it. usecases.json and plan.json go up as they are. .sync.json remembers what both sides had last time.
+ */
+async function syncDesign(p, { quiet = false } = {}) {
+  const dir = designDirOf(p);
+  mkdirSync(dir, { recursive: true });
+  const stateFile = path.join(dir, ".sync.json");
+  const last = readJson(stateFile, {});
+  const remote = await api("GET", `/api/projects/${p}/sync`);
+  const there = Object.fromEntries(Object.entries(remote.files ?? {}).filter(([rel]) => SYNCED(rel)));
+  const here = {};
+  for (const rel of walkFiles(dir)) if (SYNCED(rel)) here[rel] = sha1(readFileSync(path.join(dir, rel)));
+  const next = {};
+  const up = [];
+  const down = [];
+  const both = [];
+  for (const rel of new Set([...Object.keys(here), ...Object.keys(there)])) {
+    const l = here[rel];
+    const r = there[rel];
+    const b = last[rel];
+    if (l === r) next[rel] = l;
+    else if (l && r && l !== b && r !== b) (both.push(rel), up.push(rel));
+    else if (l && l !== b) up.push(rel);
+    else if (r && r !== b) down.push(rel);
+    else if (l) next[rel] = l; // removed there, unchanged here: keep it
+  }
+  for (const rel of up) {
+    const body = readFileSync(path.join(dir, rel));
+    await upload(p, rel, body);
+    next[rel] = sha1(body);
+  }
+  for (const rel of down) {
+    const body = await download(p, rel);
+    if (!body) continue;
+    mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    writeFileSync(path.join(dir, rel), body);
+    next[rel] = sha1(body);
+  }
+  // The sims' definitions and the plan are Claude's: this folder's copy is the one that counts.
+  const useCases = readJson(path.join(dir, "usecases.json"), undefined);
+  const plan = readJson(path.join(dir, "plan.json"), undefined);
+  const { remote: gitRemote, branch } = gitInfo();
+  await api("POST", `/api/projects/${p}/sync`, {
+    ...(useCases !== undefined ? { useCases } : {}),
+    ...(plan !== undefined ? { plan } : {}),
+    git: { remote: gitRemote, branch },
+  });
+  if (useCases === undefined && plan === undefined && remote.useCases?.length) {
+    // Another computer designed it: start from what SimSites has.
+    writeFileSync(path.join(dir, "usecases.json"), JSON.stringify(remote.useCases, null, 2) + "\n");
+    if (remote.plan) writeFileSync(path.join(dir, "plan.json"), JSON.stringify(remote.plan, null, 2) + "\n");
+  }
+  writeFileSync(stateFile, JSON.stringify(next, null, 2) + "\n");
+  if (!quiet && !JSON_OUT && both.length) progress(`changed both here and on SimSites, kept this folder's: ${both.join(", ")}`);
+  return { up, down, capture: remote.capture ?? null };
+}
+
+/**
+ * An answer from SimSites names files by their place in the feature (sims/x/look/storyboard.jpg): download each one
+ * into the design folder and answer with the local path instead, so Claude reads them where it always does.
+ */
+async function localize(p, value) {
+  const dir = designDirOf(p);
+  const isFile = (v) => typeof v === "string" && /^(sims|references)\/[^\s]+\.[a-z0-9]{2,5}$/i.test(v) && !v.includes("..");
+  const wanted = new Set();
+  const collect = (v) => {
+    if (isFile(v)) wanted.add(v);
+    else if (Array.isArray(v)) v.forEach(collect);
+    else if (v && typeof v === "object") Object.values(v).forEach(collect);
+  };
+  collect(value);
+  // The report of a look sits next to its frames: Claude reads it too.
+  for (const f of [...wanted]) if (/^sims\/[^/]+\/look\//.test(f)) wanted.add(f.replace(/look\/.*$/, "look/report.json"));
+  const list = [...wanted];
+  for (let i = 0; i < list.length; i += 6)
+    await Promise.all(
+      list.slice(i, i + 6).map(async (rel) => {
+        const body = await download(p, rel);
+        if (!body) return;
+        mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+        writeFileSync(path.join(dir, rel), body);
+      }),
+    );
+  // Look's folders are whole again: frames of an older version that aren't in this answer go.
+  const looks = new Set(list.filter((f) => /^sims\/[^/]+\/look\/\d\d-/.test(f)).map((f) => path.dirname(f)));
+  for (const d of looks)
+    for (const f of walkFiles(path.join(dir, d))) if (/^(m-)?\d\d-.*\.jpg$/.test(f) && !wanted.has(`${d}/${f}`)) rmSafe(path.join(dir, d, f));
+  const map = (v) => (isFile(v) ? path.join(dir, v) : Array.isArray(v) ? v.map(map) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, map(x)])) : v);
+  const out = map(value);
+  // look's own folder (sims/x/look) has no extension: it's a folder.
+  if (out && typeof out.dir === "string" && /^sims\//.test(out.dir)) out.dir = path.join(dir, out.dir);
+  return out;
+}
+
+function rmSafe(file) {
+  try {
+    rmSync(file, { force: true });
+  } catch {}
+}
+
+/**
+ * Playwright, for capturing the app and verifying the build on this machine: from ~/.simsites/runner, installed there
+ * the first time (SIMSITES_PLAYWRIGHT_DIR: a folder that already has it). Its browser too, unless one is installed.
+ */
+async function loadPlaywright() {
+  const { createRequire } = await import("node:module");
+  const runner = path.join(HOME_DIR, "runner");
+  const from = (dir) => {
+    try {
+      return createRequire(path.join(dir, "package.json"))("playwright");
+    } catch {
+      return null;
+    }
+  };
+  let pw = (process.env.SIMSITES_PLAYWRIGHT_DIR && from(process.env.SIMSITES_PLAYWRIGHT_DIR)) || from(runner);
+  if (!pw) {
+    progress("Installing Playwright, which SimSites uses to capture your app and verify the build (once) …");
+    mkdirSync(runner, { recursive: true });
+    if (!existsSync(path.join(runner, "package.json"))) writeFileSync(path.join(runner, "package.json"), '{ "private": true }\n');
+    try {
+      execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "playwright@1.63.0"], { cwd: runner, stdio: ["ignore", "ignore", "inherit"] });
+    } catch {
+      fail(`Installing Playwright failed. Install it yourself: cd ${runner} && npm install playwright@1.63.0`);
+    }
+    pw = from(runner);
+    if (!pw) fail(`Playwright isn't loadable from ${runner}.`);
+  }
+  const { findInstalledChromium } = await import(pathToFileURL(path.join(PLUGIN_DIR, "runner", "chromium.mjs")).href);
+  let own = null;
+  try {
+    own = pw.chromium.executablePath();
+  } catch {}
+  if (!(own && existsSync(own)) && !findInstalledChromium()) {
+    progress("Downloading the browser Playwright uses (once) …");
+    try {
+      execFileSync(process.execPath, [createRequire(path.join(runner, "package.json")).resolve("playwright/cli.js"), "install", "chromium"], { stdio: ["ignore", "ignore", "inherit"] });
+    } catch {
+      fail("Downloading Chromium failed. Run: npx playwright install chromium");
+    }
+  }
+  return pw;
+}
+
+/** Capture the running app into the design folder's references/ and put the screens on SimSites. */
+async function captureLocal(p, { routes, add = null, brief = "" } = {}) {
+  const cfg = repoConfig();
+  const { chromium } = await loadPlaywright();
+  const { captureScreens, routesNamedIn } = await import(pathToFileURL(path.join(PLUGIN_DIR, "runner", "capture.mjs")).href);
+  const repo = { path: ROOT, devUrl: cfg.devUrl, routes: cfg.routes ?? ["/"] };
+  const authFile = path.join(ROOT, ".simsites", "auth.json");
+  const before = add ? ((await syncDesign(p, { quiet: true })).capture ?? null) : null;
+  const capture = await captureScreens({
+    chromium,
+    dir: path.join(designDirOf(p), "references"),
+    repo,
+    routes: add ?? [...new Set([...(routes ?? repo.routes), ...(await routesNamedIn(brief, repo))])],
+    storageState: existsSync(authFile) ? authFile : undefined,
+    add: !!add,
+    before,
+    log: (x) => !JSON_OUT && progress(x),
+  });
+  await syncDesign(p, { quiet: true });
+  await api("POST", `/api/projects/${p}/sync`, { capture });
+  return capture;
+}
+
+// ---- repo detection --------------------------------------------------------------------------
+
+const frameworkOf = (pkg) => {
+  const deps = { ...(pkg?.dependencies ?? {}), ...(pkg?.devDependencies ?? {}) };
+  return deps.next ? "next" : deps.vite ? "vite" : deps["react-scripts"] ? "cra" : deps.astro ? "astro" : deps["@sveltejs/kit"] ? "sveltekit" : deps.nuxt ? "nuxt" : null;
+};
+
+/** The web app's folder: the repo itself, or in a monorepo (apps/web, apps/site, …) the first app with a web framework. */
+function webAppDir() {
+  if (frameworkOf(readJson(path.join(ROOT, "package.json"), null))) return ROOT;
+  for (const group of ["apps", "packages"]) {
+    let names = [];
+    try {
+      names = readdirSync(path.join(ROOT, group));
+    } catch {
+      continue;
+    }
+    const rank = (n) => (["web", "app", "frontend", "site", "www", "dashboard"].includes(n) ? 0 : 1);
+    for (const n of names.sort((a, b) => rank(a) - rank(b))) {
+      if (frameworkOf(readJson(path.join(ROOT, group, n, "package.json"), null))) return path.join(ROOT, group, n);
+    }
+  }
+  return ROOT;
+}
+const APP_DIR = webAppDir();
+
+function detectDev() {
+  const pkg = readJson(path.join(ROOT, "package.json"), null);
+  const app = APP_DIR === ROOT ? pkg : readJson(path.join(APP_DIR, "package.json"), null);
+  const scripts = pkg?.scripts ?? {};
+  const dev = scripts.dev || scripts.start || "";
+  const framework = frameworkOf(app);
+  // The port is in the web app's own dev script (a monorepo's root script just runs turbo/nx).
+  const appDev = app?.scripts?.dev || app?.scripts?.start || dev;
+  const m = appDev.match(/(?:--port|-p)[ =](\d{2,5})/) || appDev.match(/PORT=(\d{2,5})/);
+  const port = m ? m[1] : { next: "3000", vite: "5173", cra: "3000", astro: "4321", sveltekit: "5173", nuxt: "3000" }[framework] ?? "3000";
+  const pm = existsSync(path.join(ROOT, "pnpm-lock.yaml")) ? "pnpm" : existsSync(path.join(ROOT, "yarn.lock")) ? "yarn" : existsSync(path.join(ROOT, "bun.lockb")) || existsSync(path.join(ROOT, "bun.lock")) ? "bun" : "npm";
+  return { framework, devUrl: `http://localhost:${port}`, devCommand: dev ? `${pm} run ${scripts.dev ? "dev" : "start"}` : null };
+}
+
+/** The detected dev URL if it answers, else the first common local port serving an HTML page (or null). */
+async function findRunningDevServer(detected) {
+  const ports = [...new Set([new URL(detected).port, "3000", "3001", "3002", "3003", "5173", "5174", "4321", "8080", "8000"])];
+  // Never the Studio this CLI talks to (its port may be the one the app's package.json names).
+  const studioPort = new URL(studioUrl()).port;
+  for (const port of ports) {
+    if (port === studioPort) continue;
+    try {
+      const res = await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(1500) });
+      if (res.ok && (res.headers.get("content-type") ?? "").includes("text/html")) return `http://localhost:${port}`;
+    } catch {}
+  }
+  return null;
+}
+
+/** Static routes of a Next.js app (app router or pages router), at most 8. */
+function detectRoutes() {
+  const routes = new Set();
+  const walk = (dir, base, router) => {
+    let entries = [];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e);
+      if (e === "node_modules" || e.startsWith(".") || e === "api") continue;
+      let st;
+      try {
+        st = statSync(full);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        if (/^\[.*\]$/.test(e) || e.startsWith("@") || e.startsWith("_")) continue;
+        if (router === "remix") {
+          // Remix folder routes: "settings.team/route.tsx" → /settings/team; "$id" folders are dynamic.
+          if (!/[$]/.test(e) && readdirSync(full).some((f) => /^route\.(t|j)sx?$/.test(f))) routes.add("/" + e.replace(/\._index$/, "").replace(/\./g, "/"));
+          continue;
+        }
+        const seg = /^\(.*\)$/.test(e) ? "" : "/" + e;
+        walk(full, base + seg, router);
+      } else if (router === "app" && /^page\.(t|j)sx?$/.test(e)) routes.add(base || "/");
+      else if (router === "svelte" && /^\+page\.svelte$/.test(e)) routes.add(base || "/");
+      else if (router === "astro" && /\.(astro|md|mdx)$/.test(e) && !/^\[/.test(e)) {
+        const name = e.replace(/\.(astro|mdx?)$/, "");
+        routes.add(name === "index" ? base || "/" : `${base}/${name}`);
+      } else if (router === "remix" && /\.(t|j)sx?$/.test(e) && !/[$]/.test(e) && !/^_/.test(e) && !/\.(server|client)\./.test(e)) {
+        // Remix flat routes: "settings.team.tsx" → /settings/team, "_index.tsx" → / (skipped above as "_"), "$id" is dynamic.
+        const name = e.replace(/\.(t|j)sx?$/, "").replace(/\._index$/, "").replace(/\./g, "/");
+        routes.add(name === "index" ? "/" : `/${name}`);
+      }
+      else if (router === "pages" && /\.(t|j)sx?$/.test(e) && !/^_/.test(e) && !/^\[/.test(e)) {
+        const name = e.replace(/\.(t|j)sx?$/, "");
+        routes.add(name === "index" ? base || "/" : `${base}/${name}`);
+      }
+    }
+  };
+  for (const d of ["app", "src/app"]) if (existsSync(path.join(APP_DIR, d))) walk(path.join(APP_DIR, d), "", "app");
+  for (const d of ["pages", "src/pages"]) {
+    if (!existsSync(path.join(APP_DIR, d))) continue;
+    const astro = existsSync(path.join(APP_DIR, "astro.config.mjs")) || existsSync(path.join(APP_DIR, "astro.config.ts"));
+    walk(path.join(APP_DIR, d), "", astro ? "astro" : "pages");
+  }
+  if (existsSync(path.join(APP_DIR, "src/routes"))) walk(path.join(APP_DIR, "src/routes"), "", "svelte");
+  if (existsSync(path.join(APP_DIR, "app/routes"))) {
+    routes.add("/");
+    walk(path.join(APP_DIR, "app/routes"), "", "remix");
+  }
+  const list = [...routes].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+  return list.length ? list.slice(0, 8) : ["/"];
+}
+
+/**
+ * Keep the Studio's run output and the saved session out of git; hand-offs (films, frames, BUILD.md) are meant to be
+ * committed — they're the regression suite. Adds missing lines to an existing .simsites/.gitignore.
+ */
+function ensureIgnored() {
+  const gi = path.join(ROOT, ".simsites", ".gitignore");
+  mkdirSync(path.dirname(gi), { recursive: true });
+  const have = existsSync(gi) ? readFileSync(gi, "utf8") : "";
+  const missing = ["*/verify/", "*/VERIFY.md", "*/verify-report.json", "auth.json", ".hook-state.json", "design/*/sims/*/look/", "design/*/sims/*/history/", "design/*/sims/*/looked.html", "design/*/.sync.json", "design/*/verify/"].filter((l) => !have.split("\n").includes(l));
+  if (missing.length) writeFileSync(gi, have + (have && !have.endsWith("\n") ? "\n" : "") + missing.join("\n") + "\n");
+}
+
+/** Same-site links on the running app's home page, e.g. ["/", "/pricing", "/settings"] (max 8). */
+async function linkedRoutes(devUrl, fallback) {
+  try {
+    const html = await (await fetch(devUrl.replace(/\/+$/, "") + "/", { signal: AbortSignal.timeout(5000) })).text();
+    const found = new Set(["/"]);
+    for (const m of html.matchAll(/href=["'](\/[a-z0-9][^"'#?\s]*)["']/gi)) {
+      const p = m[1].replace(/\/+$/, "");
+      if (!/\.[a-z0-9]{2,5}$/i.test(p) && !/^\/(_next|static|assets|api|cdn-cgi)\b/.test(p)) found.add(p);
+    }
+    return [...found].slice(0, 8);
+  } catch {
+    return fallback;
+  }
+}
+
+// ---- formatting ------------------------------------------------------------------------------
+
+const STATUS = {
+  empty: c.dim("waiting"),
+  generating: c.blue("generating"),
+  draft: "draft",
+  changes: c.blue("changing"),
+  approved: c.green("approved"),
+  error: c.red("error"),
+};
+
+function printSummary(s) {
+  out(`${c.bold(s.project.title)} ${c.dim(`(${s.project.id})`)}`);
+  if (s.project.repo) out(c.dim(`repo ${s.project.repo.path} · app ${s.project.repo.devUrl}`));
+  out(`watch: ${s.watchUrl ?? s.reviewUrl}${s.listening ? c.dim("  (Claude Code is listening)") : ""}`);
+  out("");
+  if (!s.useCases.length) out(c.dim("No sims yet."));
+  for (const u of s.useCases) {
+    const extra = [u.error ? c.red(u.error.slice(0, 80)) : ""].filter(Boolean).join(" ");
+    out(`  ${(STATUS[u.status] ?? u.status).padEnd(20)} ${u.title} ${c.dim(u.id)} ${extra}`);
+  }
+  if (s.plan) out(c.dim(`\n${s.plan.scope} feature — ${s.plan.reason}`));
+  if (s.assumptions?.length) out(c.dim(`\n${s.assumptions.length} decisions and assumptions — change them in the Studio (Details on the watch page)`));
+  if (s.inbox?.length) out(c.yellow(`\n${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"} from the Studio waiting — simsites inbox`));
+}
+
+// ---- commands --------------------------------------------------------------------------------
+
+const commands = {
+  async help() {
+    out(`${c.bold("simsites")} — simulate a feature with SimSites, then build it with Claude Code
+
+Setup
+  simsites auth <token> [--url URL]    sign this computer in to SimSites (token from its settings page)
+  simsites push [--replace]            import a feature designed with an old local Studio into SimSites
+  simsites init [--dev-url URL] [--routes /,/settings] [--reset-command CMD]
+                                       link this repo (detects dev URL and routes)
+
+Design a feature in Claude Code (you draw the sims; SimSites renders and checks them)
+  simsites design "<feature>" [--title "<2–5 words>"] [--map /a,/b] [--ref mock.png,…] [--team <name>|none] [--issue LIN-123]
+                                       start: capture the app, write CONTRACT.md + references into .simsites/design/<id>/
+  simsites look <sim>|--all [--note "…"] [--reply c1,c2] [--take N]
+                                       render a sim: storyboard, frames, the app today, automatic checks (fix ✗ first)
+  simsites coverage [--ignore sim:key,sim:key] [--note "why"]
+                                       new controls in the sims that no sim demonstrates (no dead buttons)
+  simsites show [<sim>] [--review] [--video]   open the watch page: the sims large and playing, Approve, comments
+                                       (--review: the full Review page; --video: also export an MP4)
+  simsites show <sim> --term          the sim's key frames right in the terminal (in Claude Code: ! simsites show <sim> --term)
+  simsites next                        Linear issues waiting for sims in your teams
+  simsites share [--watch-only]        a link to the sims for people without an account (comment and approve, or only watch)
+  simsites show <sim> --gif [--phone] the sim as an animated GIF (look/sim.gif) to send where images are shown
+  simsites show <sim> --zoom          every step's target at full size on one sheet (look/zoom.jpg), for small details
+  simsites show <sim> --labels [--at s]  a frame with numbered badges on every element + legend ("make #3 bigger")
+  simsites undo <sim>                 back to the version before the last change
+  simsites sims                       sims with status, check score and open comments
+  simsites inbox [--done c1,c2]        comments from the Studio waiting for you
+  simsites recapture                   capture the app's screens again
+  simsites pull                        bring this feature's design folder in step with SimSites (another computer)
+
+Review and approve (the user, on the watch page — or in the conversation)
+  simsites open                        open the watch page (watch, comment, approve)
+  simsites wait --until decision       wait for the next thing the user does on the watch page (approve, comment)
+  simsites wait [--until approved]     wait until every sim is approved (or a comment arrives)
+  simsites wait --until fixes          after the build: wait for the reviewer's next fix request
+  simsites approve <sim>|--all [--take N]   approve sims, on the user's explicit word (--take: keep that take)
+  simsites keep <sim> <N>             keep take N of a sim (it becomes the sim), without approving
+  simsites status [--watch]            sims, approvals, assumptions, comments waiting
+  simsites list · simsites use <id>    this repo's features / switch the current one
+  simsites cancel [--project <id>]     put a feature away
+  simsites login [/path]               sign in to your app once; capture and verify then run signed in
+  simsites version                     the plugin version and the Studio it talks to
+
+Build it
+  simsites handoff [--drafts]          write approved sims + BUILD.md into .simsites/<feature>/
+  simsites progress "<note>"           tell the Studio what you're doing while you build
+  simsites verify [--all]              replay every approved flow against your dev server (--all: every feature)
+  simsites fixes [--done <id>]         the reviewer's fix requests (comments on built-vs-approved pairs)
+
+  Global: --project <id> (default: the current feature) · --json · --repo <path>`);
+  },
+
+  /**
+   * Import a feature designed with a local Studio into a hosted SimSites (`simsites auth <token> --url …` first):
+   * its sims, their state, history, comments and decisions, then its files. --replace overwrites a feature you pushed
+   * before. Until the CLI renders sims itself, this is how a feature gets into the cloud.
+   */
+  async push() {
+    const p = currentProject();
+    const dir = path.join(ROOT, ".simsites", "design", p);
+    if (!existsSync(path.join(dir, "project.json"))) fail(`No design folder for ${p} in this repo (.simsites/design/${p}/).`);
+    if (!studioToken()) fail(`Push goes to a hosted SimSites: simsites auth <token> --url <its URL> first.`);
+    const json = (rel, fb = null) => readJson(path.join(dir, rel), fb);
+    const project = json("project.json");
+    const useCases = json("usecases.json", []);
+    const sims = useCases.map((u) => u.id).filter((id) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(id));
+    const chat = (id) =>
+      (existsSync(path.join(dir, "sims", id, "chat.jsonl")) ? readFileSync(path.join(dir, "sims", id, "chat.jsonl"), "utf8") : "")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l));
+    const DOCS = ["plan.json", "decisions.json", "build-progress.json", "references/capture.json", "coverage-scan.json", "coverage-decisions.json", "fixes.json", "verify/report.json"];
+    const body = {
+      id: p,
+      title: project.title,
+      brief: existsSync(path.join(dir, "brief.md")) ? readFileSync(path.join(dir, "brief.md"), "utf8") : "",
+      createdAt: project.createdAt,
+      repo: { ...project.repo, path: ROOT, name: path.basename(ROOT) },
+      map: !!project.map,
+      useCases,
+      metas: Object.fromEntries(sims.map((id) => [id, json(path.join("sims", id, "meta.json"), {})])),
+      chats: Object.fromEntries(sims.map((id) => [id, chat(id)])),
+      inbox: json("inbox.json", []),
+      docs: Object.fromEntries(DOCS.map((d) => [d, json(d)]).filter(([, v]) => v != null)),
+      scenes: sims.filter((id) => existsSync(path.join(dir, "sims", id, "scene.html"))),
+      replace: !!flags.replace,
+    };
+    const r = await api("POST", "/api/import", body, { timeoutMs: 120000 });
+    // The files: everything but the documents just sent, and nothing hidden or temporary.
+    const SKIP = new Set(["project.json", "usecases.json", "inbox.json", "brief.md", ...DOCS]);
+    const files = [];
+    const walk = (rel) => {
+      for (const name of readdirSync(path.join(dir, rel))) {
+        if (name.startsWith(".") || name.endsWith(".tmp")) continue;
+        const sub = rel ? `${rel}/${name}` : name;
+        const st = statSync(path.join(dir, sub));
+        if (st.isDirectory()) walk(sub);
+        else if (!SKIP.has(sub) && !/^sims\/[^/]+\/(meta\.json|chat\.jsonl)$/.test(sub) && /^(sims|references|style)\/|^[\w.-]+\.(md|html|css)$/.test(sub)) files.push({ rel: sub, size: st.size });
+      }
+    };
+    walk("");
+    const MAX = 4 * 1024 * 1024; // a request body the hosted SimSites accepts
+    let sent = 0;
+    const skipped = [];
+    for (const f of files) {
+      if (f.size > MAX) {
+        skipped.push(f.rel);
+        continue;
+      }
+      const res = await studioFetch(`/api/projects/${p}/files/${f.rel.split("/").map(encodeURIComponent).join("/")}`, {
+        method: "PUT",
+        body: readFileSync(path.join(dir, f.rel)),
+        signal: AbortSignal.timeout(60000),
+      }).catch((err) => ({ ok: false, status: 0, json: async () => ({ error: String(err) }) }));
+      if (!res.ok) fail(`Uploading ${f.rel} failed: ${(await res.json().catch(() => ({}))).error ?? `HTTP ${res.status}`}. Run simsites push --replace to try again.`);
+      sent++;
+      if (!JSON_OUT && sent % 20 === 0) progress(`${sent}/${files.length} files`);
+    }
+    if (JSON_OUT) return out(JSON.stringify({ ok: true, id: r.id, sims: sims.length, files: sent, skipped }));
+    out(c.green("✓ ") + `Pushed ${p}: ${sims.length} sim${sims.length === 1 ? "" : "s"}, ${sent} files.`);
+    if (skipped.length) out(c.yellow("• ") + `Too big to upload (over 4 MB), left out: ${skipped.join(", ")}`);
+    out(`  ${studioUrl()}/p/${p}/watch`);
+  },
+
+  /** Save the token for a hosted SimSites (made on its settings page). --url sets which SimSites this computer uses. */
+  async auth() {
+    if (flags.url) saveHome({ studioUrl: String(flags.url).replace(/\/+$/, "") });
+    const token = pos[0];
+    if (!token) {
+      const has = !!studioToken();
+      return out(JSON_OUT ? JSON.stringify({ studioUrl: studioUrl(), token: has }) : `${studioUrl()}: ${has ? "token saved" : c.yellow("no token")} ${c.dim("(simsites auth <token> [--url URL])")}`);
+    }
+    if (!token.startsWith("sst_")) fail("That isn't a SimSites token (they start with sst_). Make one on the settings page.");
+    // Check it before saving: a token the SimSites refuses is never stored.
+    const me = await fetch(studioUrl() + "/api/me", { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(8000) })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, status: r.status, ...d })))
+      .catch(() => null);
+    if (me && !me.ok) fail(`${studioUrl()} didn't accept that token: ${String(me.error ?? `HTTP ${me.status}`).replace(/\.+$/, "")}. Make a new one in ${studioUrl()}/settings.`);
+    mkdirSync(HOME_DIR, { recursive: true });
+    writeFileSync(CREDENTIALS, JSON.stringify({ ...readJson(CREDENTIALS, {}), [studioUrl()]: token }, null, 2) + "\n", { mode: 0o600 });
+    installShortcut();
+    if (JSON_OUT) return out(JSON.stringify({ ok: true, studioUrl: studioUrl(), login: me?.login ?? null }));
+    if (me) out(c.green("✓ ") + `Signed in to ${studioUrl()} as ${me.login}.`);
+    else out(c.yellow("• ") + `Saved. ${studioUrl()} didn't answer, so the token isn't checked yet.`);
+  },
+
+  /**
+   * Apps behind a sign-in: open a browser window on the app, the developer signs in, and the session is saved to
+   * .simsites/auth.json (git-ignored) so the Studio captures and verify replays signed-in pages.
+   */
+  async login() {
+    const cfg = repoConfig();
+    if (!cfg) fail("Link the repo first: simsites init");
+    const { chromium } = await loadPlaywright();
+    const file = path.join(ROOT, ".simsites", "auth.json");
+    const { launchChromium } = await import(pathToFileURL(path.join(PLUGIN_DIR, "runner", "chromium.mjs")).href);
+    const browser = await launchChromium(chromium, { headless: false });
+    const ctx = await browser.newContext({ viewport: null, ...(existsSync(file) ? { storageState: file } : {}) });
+    const page = await ctx.newPage();
+    const start = String(pos[0] || "/");
+    await page.goto(cfg.devUrl + (start.startsWith("/") ? start : `/${start}`)).catch(() => {});
+    out(`Sign in to your app in the browser window that opened, then close the window.`);
+    // Keep the latest session while the window is open: once it's closed the context is gone.
+    let state = null;
+    const deadline = Date.now() + Number(flags.timeout || 600) * 1000;
+    while (browser.isConnected() && page && !page.isClosed() && Date.now() < deadline) {
+      state = await ctx.storageState().catch(() => state);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    await browser.close().catch(() => {});
+    // Only the app's own session: not the identity provider's cookies (Google, GitHub…) from the sign-in round trip.
+    const host = new URL(cfg.devUrl).hostname;
+    if (state) {
+      state = {
+        cookies: state.cookies.filter((ck) => ck.domain.replace(/^\./, "") === host || host.endsWith(`.${ck.domain.replace(/^\./, "")}`)),
+        origins: state.origins.filter((o) => new URL(o.origin).hostname === host),
+      };
+    }
+    if (!state || (!state.cookies.length && !state.origins.length)) fail("No session was saved (no cookies or local storage for your app).");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+    chmodSync(file, 0o600); // also when it already existed
+    ensureIgnored();
+    out(c.green("✓ ") + `Saved your session to .simsites/auth.json (git-ignored, never uploaded): capture and verify run signed in.`);
+  },
+
+  /** Stop a feature's agents and put it away (the Studio keeps it in workspace/.trash). */
+  async cancel() {
+    const p = currentProject();
+    await api("DELETE", `/api/projects/${p}`);
+    const cfg = repoConfig() ?? {};
+    const features = (cfg.features ?? []).filter((f) => f !== p);
+    saveRepo({ features, current: cfg.current === p ? (features.at(-1) ?? null) : cfg.current });
+    out(JSON_OUT ? JSON.stringify({ ok: true, cancelled: p }) : c.green("✓ ") + `Put ${p} away. (The Studio keeps it in workspace/.trash.)`);
+  },
+
+  async init() {
+    const d = detectDev();
+    const prev = repoConfig() ?? {};
+    // The dev server may already run on another port than the default (e.g. 3000 was taken): use the one that answers.
+    if (!flags["dev-url"] && !prev.devUrl) {
+      const running = await findRunningDevServer(d.devUrl);
+      if (running) d.devUrl = running;
+    }
+    let routes = flags.routes ? String(flags.routes).split(",").map((r) => r.trim()).filter(Boolean) : prev.routes ?? detectRoutes();
+    // No routes in the code we can read (Vite + React Router, Rails, Django…): follow the running app's own links.
+    if (!flags.routes && !prev.routes && routes.length === 1) routes = await linkedRoutes(String(flags["dev-url"] || d.devUrl), routes);
+    const cfg = {
+      devUrl: String(flags["dev-url"] || prev.devUrl || d.devUrl).replace(/\/+$/, ""),
+      devCommand: flags["dev-command"] ? String(flags["dev-command"]) : prev.devCommand ?? d.devCommand,
+      routes,
+      ...(flags["reset-command"] || prev.resetCommand ? { resetCommand: String(flags["reset-command"] || prev.resetCommand) } : {}),
+      current: prev.current ?? null,
+      features: prev.features ?? [],
+    };
+    if (new URL(cfg.devUrl).origin === new URL(studioUrl()).origin)
+      fail(`${cfg.devUrl} is SimSites itself, not your app. Start your app's dev server on another port and run: simsites init --dev-url <its URL>`);
+    saveRepo(cfg);
+    ensureIgnored();
+    if (JSON_OUT) return out(JSON.stringify({ ok: true, repo: ROOT, ...cfg, framework: d.framework }));
+    out(c.green("✓ ") + `Linked ${ROOT}`);
+    out(`  framework   ${d.framework ?? c.dim("unknown")}${APP_DIR !== ROOT ? c.dim(`  (${path.relative(ROOT, APP_DIR)})`) : ""}`);
+    out(`  dev server  ${cfg.devUrl}${cfg.devCommand ? c.dim(`  (${cfg.devCommand})`) : ""}`);
+    out(`  screens     ${cfg.routes.join("  ")}`);
+    out(c.dim(`Saved ${path.relative(process.cwd(), REPO_CONFIG) || REPO_CONFIG}. Edit it to change routes or add a resetCommand.`));
+  },
+
+  async status() {
+    const p = currentProject();
+    const once = async () => {
+      const s = await api("GET", `/api/projects/${p}/summary`);
+      if (JSON_OUT) return out(JSON.stringify(s));
+      if (flags.watch) process.stdout.write("\x1b[2J\x1b[H");
+      printSummary(s);
+    };
+    await once();
+    if (flags.watch && !JSON_OUT) for (;;) await new Promise((r) => setTimeout(r, 3000)).then(once);
+  },
+
+  /** Wait for what the user does on the watch page (see repoWait). */
+  async wait() {
+    return repoWait(currentProject());
+  },
+
+  async approve() {
+    const p = currentProject();
+    if (flags.all || pos[0] === "all") {
+      const r = await api("POST", `/api/projects/${p}/approve-all`, {});
+      rememberApproved(p, r.approved ?? []);
+      if (JSON_OUT) return out(JSON.stringify(r));
+      if (r.approved.length) out(c.green("✓ ") + `Approved ${r.approved.length}: ${r.approved.join(", ")}`);
+      else out(c.yellow("• ") + "Nothing approved yet.");
+      for (const s of r.skipped) out(c.yellow("• ") + `${s.title} ${c.dim(s.id)}: ${s.reason}`);
+      return;
+    }
+    if (!pos[0]) fail("Usage: simsites approve <use-case-id> | --all");
+    // A film with takes: --take N keeps that take (it becomes the film) and approves it; without it, take 1.
+    const take = flags.take ? Number(flags.take) : undefined;
+    if (!take) {
+      const sum = await api("GET", `/api/projects/${p}/summary`).catch(() => null);
+      const takes = (sum?.useCases ?? []).find((u) => u.id === pos[0])?.takes ?? [];
+      if (takes.length) fail(`${pos[0]} has other takes (${takes.map((t) => t.n).join(", ")}): say which one is approved — simsites approve ${pos[0]} --take N (1 = the sim as it is).`);
+    }
+    const r = await api("POST", `/api/projects/${p}/sims/${pos[0]}`, { action: "approve", ...(take ? { take } : {}) });
+    rememberApproved(p, [pos[0]]);
+    out(JSON_OUT ? JSON.stringify(r) : c.green("✓ ") + `Approved ${pos[0]}${take ? ` (take ${take})` : ""}`);
+  },
+
+  /** Keep take N of a film (it becomes the film; the other takes are discarded) without approving it. */
+  async keep() {
+    const [sim, n] = pos;
+    if (!sim || !n) fail("Usage: simsites keep <sim> <take number>   (1 = the sim as it is)");
+    const p = currentProject();
+    const r = await api("POST", `/api/projects/${p}/sims/${sim}`, { action: "keep-take", take: Number(n) });
+    if (await isHosted()) await syncDesign(p, { quiet: true });
+    out(JSON_OUT ? JSON.stringify(r) : c.green("✓ ") + `Kept take ${n} of ${sim} — it is the sim now (run simsites look ${sim} to see it).`);
+  },
+
+  async handoff() {
+    const p = currentProject();
+    const r = (await isHosted()) ? await handoffHosted(p) : await api("POST", `/api/projects/${p}/handoff`, { includeDrafts: !!flags.drafts }, { timeoutMs: 180000 });
+    if (JSON_OUT) return out(JSON.stringify(r));
+    out(c.green("✓ ") + `Handed off ${r.sims.length} simulation${r.sims.length === 1 ? "" : "s"} to ${path.relative(process.cwd(), r.dir) || r.dir}`);
+    for (const s of r.sims) out(`  ${s.title} ${c.dim(`${s.id} · ${s.steps} steps`)}`);
+    for (const s of r.skipped) out(c.yellow("  skipped ") + `${s.title} ${c.dim(`${s.id}: ${s.reason}`)}`);
+    out(c.dim(`Next: implement ${path.relative(process.cwd(), path.join(r.dir, "BUILD.md"))}, fill routes.json, then simsites verify`));
+  },
+
+  async verify() {
+    ensureIgnored(); // repos linked before VERIFY.md was ignored
+    if (flags.all) return verifyAll();
+    const p = currentProject();
+    if (!JSON_OUT) out(c.dim(`Replaying every approved flow against ${repoConfig()?.devUrl ?? "your dev server"} …`));
+    const rep = await runVerify(p);
+    if (JSON_OUT) {
+      out(JSON.stringify({ ok: true, report: rep }));
+      process.exit(rep.ok ? 0 : 1);
+    }
+    printReport(rep);
+    out("");
+    if (rep.ok) out(c.green("All flows pass.") + (lookDifferent(rep).length ? c.yellow(" But some steps don't look like the approved sim — see above.") : ""));
+    else {
+      out(c.red("Some flows fail.") + c.dim(" Details for Claude: .simsites/" + p + "/VERIFY.md"));
+      process.exit(1);
+    }
+  },
+
+  /** A note on what Claude Code is doing while it builds, shown live on the Review page. */
+  async progress() {
+    const note = pos.join(" ").trim();
+    if (!note) fail('Usage: simsites progress "Adding the invite dialog to TeamSettings.tsx"');
+    await api("POST", `/api/projects/${currentProject()}/progress`, { note });
+    if (JSON_OUT) out(JSON.stringify({ ok: true }));
+  },
+
+  /** The reviewer's fix requests: comments on built-vs-approved pairs, for Claude Code to fix in the app. */
+  async fixes() {
+    const p = currentProject();
+    if (flags.done) {
+      await api("POST", `/api/projects/${p}/fixes`, { done: String(flags.done) });
+      return out(JSON_OUT ? JSON.stringify({ ok: true }) : c.green("✓ ") + `Marked ${flags.done} done.`);
+    }
+    const { fixes } = await api("GET", `/api/projects/${p}/fixes`);
+    const open = fixes.filter((f) => f.status === "open");
+    if (JSON_OUT) return out(JSON.stringify(open));
+    if (!open.length) return out(c.dim("No open fix requests."));
+    for (const f of open) out(`${c.bold(f.id)} ${f.sim} · step ${f.step}: ${f.message}`);
+    out(c.dim(`\nScreenshots for each: .simsites/${p}/FIXES.md · when fixed: simsites verify, then simsites fixes --done <id>`));
+  },
+
+  async open() {
+    const s = await api("GET", `/api/projects/${currentProject()}/summary`);
+    // SIMSITES_NO_OPEN=1: just print the URL (CI, tests, remote shells).
+    if (!process.env.SIMSITES_NO_OPEN) {
+      try {
+        execFileSync(process.platform === "darwin" ? "open" : "xdg-open", [s.watchUrl ?? s.reviewUrl], { stdio: "ignore" });
+      } catch {}
+    }
+    out(s.watchUrl ?? s.reviewUrl);
+  },
+
+  async list() {
+    const cfg = repoConfig();
+    const all = await api("GET", "/api/projects");
+    // This repo's features: started here, or by a teammate in their clone of the same app.
+    const mine = all.filter((p) => p.repo?.path === ROOT || (p.team && p.repo?.name === path.basename(ROOT)));
+    if (JSON_OUT) return out(JSON.stringify(mine));
+    if (!mine.length) return out(c.dim("No features for this repo yet."));
+    for (const p of mine) out(`${p.id === cfg?.current ? c.green("●") : " "} ${p.title} ${c.dim(p.id)}`);
+  },
+
+  async use() {
+    if (!pos[0]) fail("Usage: simsites use <feature-id>");
+    saveRepo({ current: pos[0] });
+    out(JSON_OUT ? JSON.stringify({ ok: true }) : c.green("✓ ") + `Current feature: ${pos[0]}`);
+  },
+};
+
+// ---- designing in Claude Code (console mode) -----------------------------------------------------------------------
+
+// Paths under the Studio's workspace symlink are shown as their real place in this repo (.simsites/design/…).
+const rel = (p) => {
+  if (!p) return p;
+  let real = p;
+  try {
+    real = realpathSync(p);
+  } catch {}
+  return path.relative(process.cwd(), real) || real;
+};
+
+function printLook(r) {
+  const errors = r.checks.checks.filter((x) => x.level === "error");
+  const warns = r.checks.checks.filter((x) => x.level === "warn");
+  out(`${c.bold(r.title)} ${c.dim(`${r.sim} · ${r.duration}s · ${r.steps.length} steps · v${r.version}${r.changed ? " (changed)" : ""} · ${r.status}`)}`);
+  out(`  storyboard  ${rel(r.storyboard)}`);
+  if (r.zoom) out(`  zoom        ${rel(r.zoom)}  ${c.dim("(each step's target, full size — read it for details)")}`);
+  if (r.storyboardMobile) out(`  phone       ${rel(r.storyboardMobile)}`);
+  if (r.compare) out(`  compare     ${rel(r.compare)}  ${c.dim(`(before | after: ${r.changedFrames} frame${r.changedFrames === 1 ? "" : "s"} changed${r.changedFrames > 4 ? ", the first 4 shown" : ""})`)}`);
+  if (r.compareMobile) out(`  compare     ${rel(r.compareMobile)}  ${c.dim(`(phone, before | after: ${r.changedPhoneFrames} changed)`)}`);
+  if (r.changed && !r.compare && !r.compareMobile) out(`  compare     ${c.dim("no frame changed visibly")}`);
+  if (r.previous) out(`  before      ${rel(r.previous)}  ${c.dim("(the whole storyboard before this change)")}`);
+  if (r.appToday) out(`  app today   ${rel(r.appToday)}  ${c.dim("(the real screen this sim starts from)")}`);
+  if (r.captured) out(c.yellow(`  ${r.captured} wasn't captured before: captured it now (references/notes.md lists its text and controls) — compare the sim with app-today.jpg`));
+  out(`  frames      ${rel(r.dir)}/  ${c.dim(`(${r.frames.length}: ${r.frames.map((f) => path.basename(f.file, ".jpg")).join(", ")})`)}`);
+  out(`  checks      ${r.checks.score}/100 ${errors.length ? c.red(`${errors.length} error${errors.length === 1 ? "" : "s"}`) : c.green("no errors")}${warns.length ? c.yellow(` · ${warns.length} warning${warns.length === 1 ? "" : "s"}`) : ""}`);
+  for (const x of [...errors, ...warns]) out(`    ${x.level === "error" ? c.red("✗") : c.yellow("⚠")} ${x.message}`);
+  out(`  watch       ${r.watchUrl ?? r.studioUrl}  ${c.dim("(this sim on the watch page)")}`);
+  // After a change, the before | after sheet is how to know the change did what was asked and nothing else.
+  if (r.changed && (r.compare || r.compareMobile)) out(c.yellow(`Read ${rel(r.compare ?? r.compareMobile)}${r.compare && r.compareMobile ? ` and ${rel(r.compareMobile)}` : ""} before telling the user: did the change do what was asked, and nothing else?`));
+  // How the user sees the sims: one link to the watch page, as the last line of the reply — never GIFs in the chat.
+  const feature = String(r.watchUrl ?? "").split("?")[0];
+  if (feature) out(c.bold(`→ When you show the sims, end your reply with this line (and send no GIFs or images): ▶ [Watch and approve the sims](${feature})`));
+}
+
+/**
+ * A hosted feature's design folder in this repo: CONTRACT.md and the request, and the look of an earlier feature of
+ * this app when there is one (style/, newest first) so the app's style isn't drawn twice.
+ */
+function startDesignFolder(id, contract, brief) {
+  const dir = designDirOf(id);
+  if (existsSync(path.join(dir, "CONTRACT.md"))) fail(`${path.relative(ROOT, dir)} already exists in the repo — move it away first`);
+  mkdirSync(path.join(dir, "references"), { recursive: true });
+  writeFileSync(path.join(dir, "CONTRACT.md"), contract ?? "");
+  writeFileSync(path.join(dir, "brief.md"), brief.trim() + "\n");
+  const designs = path.dirname(dir);
+  const earlier = readdirSync(designs)
+    .filter((d) => d !== id && existsSync(path.join(designs, d, "style", "tokens.css")))
+    .map((d) => ({ d, at: statSync(path.join(designs, d, "style", "tokens.css")).mtimeMs }))
+    .sort((a, b) => b.at - a.at)[0];
+  if (earlier) {
+    for (const rel of walkFiles(path.join(designs, earlier.d, "style"))) {
+      if (rel === "FROM.md") continue;
+      mkdirSync(path.dirname(path.join(dir, "style", rel)), { recursive: true });
+      writeFileSync(path.join(dir, "style", rel), readFileSync(path.join(designs, earlier.d, "style", rel)));
+    }
+    writeFileSync(path.join(dir, "style", "FROM.md"), `Copied from the earlier feature "${earlier.d}". It already reproduces the app's look: keep it, add what this feature needs, and fix anything that no longer matches the app.\n`);
+  }
+  return dir;
+}
+
+/**
+ * One look at a sim. Hosted, its files come down into the design folder; a sim that starts on a screen not captured
+ * yet gets that screen captured here (SimSites can't reach the app) and is looked at again.
+ */
+async function lookAt(p, sim, body) {
+  const ask = () => api("POST", `/api/projects/${p}/console`, { action: "look", sim, ...body }, { timeoutMs: 240000 });
+  if (!(await isHosted())) return ask();
+  let r = await ask();
+  const route = r.needsCapture;
+  if (route) {
+    if (!JSON_OUT) progress(`capturing ${route} (the sim starts there)`);
+    const cap = await captureLocal(p, { add: [route] });
+    r = await ask();
+    delete r.needsCapture;
+    if ((cap.screens ?? []).some((x) => x.route === route)) r.captured = route;
+  }
+  return localize(p, r);
+}
+
+/**
+ * The hand-off from a hosted SimSites: it builds the bundle (frames rendered there), this copies it into
+ * .simsites/<feature>/. routes.json goes up first, so the start routes you set are kept.
+ */
+async function handoffHosted(p) {
+  await syncDesign(p, { quiet: true });
+  const dest = path.join(ROOT, ".simsites", p);
+  const routes = path.join(dest, "routes.json");
+  if (existsSync(routes)) await upload(p, "handoff/routes.json", readFileSync(routes));
+  const r = await api("POST", `/api/projects/${p}/handoff`, { includeDrafts: !!flags.drafts }, { timeoutMs: 300000 });
+  // Rendered on this machine (no render worker): the bundle is already in the repo.
+  if (!r.files) return r;
+  for (let i = 0; i < r.files.length; i += 6)
+    await Promise.all(
+      r.files.slice(i, i + 6).map(async (rel) => {
+        const body = await download(p, `handoff/${rel}`);
+        if (!body) fail(`Downloading the hand-off's ${rel} failed. Run simsites handoff again.`);
+        mkdirSync(path.dirname(path.join(dest, rel)), { recursive: true });
+        writeFileSync(path.join(dest, rel), body);
+      }),
+    );
+  return { ...r, dir: dest };
+}
+
+/** On a hosted SimSites: the design folder goes up first, and what the answer names comes down after. */
+async function onSimSites(p, method, url, body, opts) {
+  if (!(await isHosted())) return api(method, url, body, opts);
+  await syncDesign(p);
+  return localize(p, await api(method, url, body, opts));
+}
+
+Object.assign(commands, {
+  /** Start a feature that Claude Code designs here, in the conversation: the Studio captures the app, nothing else. */
+  async design() {
+    const feature = pos.join(" ").trim();
+    // --issue LIN-123 (or just "LIN-123" as the feature): the Linear issue is the brief.
+    const issue = flags.issue ? String(flags.issue) : /^[A-Z][A-Z0-9]{0,9}-\d+$/.test(feature) ? feature : null;
+    if (!feature && !issue) fail('Describe the feature: simsites design "Let admins invite teammates by email" (or --issue LIN-123)');
+    if (!repoConfig()) await commands.init.call(null, true);
+    const cfg = repoConfig();
+    await ensureStudio();
+    const mapRoutes = flags.map ? String(flags.map).split(",").map((r) => r.trim()).filter((r) => r.startsWith("/")) : null;
+    const title = String(flags.title || (issue && feature === issue ? "" : feature.split(/[.\n]/)[0])).slice(0, 60);
+    if (!JSON_OUT) out(c.dim(`Capturing ${cfg.devUrl} (desktop and phone) …`));
+    const hosted = await isHosted();
+    const r = await api(
+      "POST",
+      "/api/projects",
+      {
+        title,
+        brief: mapRoutes ? `Map the app as it is today on ${mapRoutes.join(", ")}: simulate the flows a user does there now, as a baseline. ${feature}` : issue && feature === issue ? "" : feature,
+        ...(issue ? { issue } : {}),
+        designer: "claude-code",
+        ...(mapRoutes ? { map: true } : {}),
+        ...(flags.team ? { team: String(flags.team) } : {}),
+        repo: { path: ROOT, devUrl: cfg.devUrl, routes: [...new Set([...(mapRoutes ?? []), ...(cfg.routes ?? [])])].slice(0, 12), resetCommand: cfg.resetCommand, name: path.basename(ROOT), remote: gitInfo().remote, branch: gitInfo().branch },
+        mode: "guided",
+      },
+      { timeoutMs: 240000 },
+    );
+    saveRepo({ current: r.id, features: [...new Set([...(cfg.features ?? []), r.id])] });
+    ensureIgnored();
+    if (hosted) {
+      // The feature lives on SimSites; its design folder is made here, and the app is captured from this machine.
+      r.designDir = startDesignFolder(r.id, r.contract, r.brief ?? feature);
+      r.capture = await captureLocal(r.id, { routes: [...new Set([...(mapRoutes ?? []), ...(cfg.routes ?? [])])].slice(0, 12), brief: r.brief ?? feature });
+    }
+    const dir = r.designDir;
+    // Mockups or screenshots the user gave ("make it look like this"): kept with the design, listed in notes.md.
+    const refs = [];
+    for (const ref of String(flags.ref ?? "").split(",").map((x) => x.trim()).filter(Boolean)) {
+      const src = path.resolve(process.cwd(), ref);
+      if (!existsSync(src)) fail(`Reference not found: ${ref}`);
+      const name = `user-${refs.length + 1}${path.extname(src).toLowerCase() || ".png"}`;
+      writeFileSync(path.join(dir, "references", name), readFileSync(src));
+      refs.push({ file: rel(path.join(dir, "references", name)), from: ref });
+    }
+    if (refs.length) {
+      const notes = path.join(dir, "references", "notes.md");
+      writeFileSync(notes, readFileSync(notes, "utf8") + `\n## References from the user\n\nWhat the user showed for this feature — follow it where it fits the app's look:\n${refs.map((x) => `- ${path.basename(x.file)} (from ${x.from})`).join("\n")}\n`);
+      if (hosted) await syncDesign(r.id, { quiet: true });
+    }
+    const cap = r.capture;
+    const result = {
+      id: r.id,
+      designDir: rel(dir),
+      contract: rel(path.join(dir, "CONTRACT.md")),
+      notes: rel(path.join(dir, "references", "notes.md")),
+      screens: (cap?.screens ?? []).map((x) => ({ route: x.route, desktop: rel(path.join(dir, "references", x.file)), phone: rel(path.join(dir, "references", x.file.replace(".jpg", "-phone.jpg"))) })),
+      failed: cap?.failed ?? [],
+      references: refs.map((x) => x.file),
+      reached: cap ? cap.reached > 0 : false,
+      // The look of an earlier feature of this app, already copied to style/ (reuse and extend it, don't redo it).
+      styleFrom: (() => {
+        try {
+          return readFileSync(path.join(dir, "style", "FROM.md"), "utf8").match(/feature "([^"]+)"/)?.[1] ?? null;
+        } catch {
+          return null;
+        }
+      })(),
+      studioUrl: r.watchUrl ?? r.reviewUrl,
+      team: r.team ?? null,
+      issue: r.issue ?? null,
+    };
+    if (JSON_OUT) return out(JSON.stringify(result));
+    out(c.green("✓ ") + `Started ${c.bold(r.id)} — designed here, in Claude Code${result.team ? c.dim(` (in the team ${result.team}: its members see it)`) : ""}`);
+    out(`  design folder  ${result.designDir}/`);
+    out(`  read first     ${result.contract}, ${result.notes}`);
+    for (const x of result.screens) out(`  screen ${x.route.padEnd(8)} ${x.desktop}  ${c.dim(x.phone)}`);
+    for (const x of result.failed) out(c.yellow(`  not captured ${x.route}: ${x.error}`));
+    if (!result.reached) out(c.yellow(`! ${cfg.devUrl} wasn't reachable: sims will be drawn from the code only. Start the dev server and run simsites recapture.`));
+    if (result.styleFrom) out(`  style/         copied from ${result.styleFrom} (the app's look, already drawn): reuse and extend it`);
+    out(c.dim(`Next: ${result.styleFrom ? "" : "write style/, "}usecases.json, plan.json and sims/<id>/scene.html, then simsites look <id>`));
+  },
+
+  /** Render a film: storyboard, frames, the app's real screen and the automatic checks (for Claude Code to Read). */
+  async look() {
+    const p = currentProject();
+    if (flags.all) {
+      // After a change to the shared style: every film changed — look at each, one line per film.
+      if (await isHosted()) await syncDesign(p);
+      const { films } = await api("GET", `/api/projects/${p}/console`);
+      const results = [];
+      for (const f of films.filter((x) => x.hasScene)) {
+        const r = await lookAt(p, f.id, { note: flags.note ? String(flags.note) : undefined });
+        results.push(r);
+        if (!JSON_OUT) {
+          const errors = r.checks.checks.filter((x) => x.level === "error").length;
+          out(`${errors ? c.red("✗") : c.green("✓")} ${r.sim} ${c.dim(`checks ${r.checks.score}${r.changedFrames ? ` · ${r.changedFrames} frames changed` : ""}`)}  ${rel(r.compare ?? r.storyboard)}`);
+          for (const x of r.checks.checks) out(`    ${x.level === "error" ? c.red("✗") : c.yellow("⚠")} ${x.message}`);
+        }
+      }
+      if (JSON_OUT) out(JSON.stringify(results.map((r) => ({ sim: r.sim, score: r.checks.score, checks: r.checks.checks, storyboard: rel(r.storyboard), compare: rel(r.compare) }))));
+      if (results.some((r) => r.checks.checks.some((x) => x.level === "error"))) process.exitCode = 2;
+      return;
+    }
+    const sim = pos[0];
+    if (!sim) fail('Usage: simsites look <sim-id> [--note "what changed"] [--reply c1,c2] [--take N]   or   simsites look --all');
+    if (await isHosted()) await syncDesign(p);
+    const r = await lookAt(p, sim, { note: flags.note ? String(flags.note) : undefined, reply: flags.reply ? String(flags.reply).split(",") : undefined, take: flags.take ? Number(flags.take) : undefined });
+    if (JSON_OUT) return out(JSON.stringify({ ...r, storyboard: rel(r.storyboard), dir: rel(r.dir), previous: rel(r.previous), compare: rel(r.compare), zoom: rel(r.zoom), appToday: rel(r.appToday), storyboardMobile: rel(r.storyboardMobile), frames: r.frames.map((f) => ({ ...f, file: rel(f.file) })) }));
+    printLook(r);
+    if (r.checks.checks.some((x) => x.level === "error")) process.exitCode = 2;
+  },
+
+  /** For the developer: open a film where they can watch it (browser / preview pane), or export it as a video. */
+  async show() {
+    const p = currentProject();
+    const sim = pos[0];
+    const s = await api("GET", `/api/projects/${p}/summary`);
+    const film = sim ? s.useCases.find((u) => u.id === sim) : null;
+    if (sim && !film) fail(`No sim "${sim}". Sims: ${s.useCases.map((u) => u.id).join(", ")}`);
+    // The watch page: the films large and playing, one by one, with Approve and comments (--review: the full page).
+    const base = flags.review ? s.reviewUrl : (s.watchUrl ?? s.reviewUrl);
+    const url = film ? `${base}?sim=${sim}` : base;
+    if (flags.labels) {
+      // The console's "point at element": a frame with numbered badges on every target, and the legend.
+      if (!sim) fail("Usage: simsites show <sim> --labels [--at <seconds>] [--phone]");
+      const r = await onSimSites(p, "POST", `/api/projects/${p}/console`, { action: "labels", sim, ...(flags.at ? { t: Number(flags.at) } : {}), ...(flags.phone ? { variant: "mobile" } : {}) }, { timeoutMs: 120000 });
+      if (JSON_OUT) return out(JSON.stringify({ ...r, file: rel(r.file) }));
+      out(`${rel(r.file)}  ${c.dim(`(at ${r.t.toFixed(1)}s)`)}`);
+      for (const l of r.legend) out(`  ${String(l.n).padStart(2)}  ${l.id}${l.text ? c.dim(`  "${l.text}"`) : ""}`);
+      return;
+    }
+    if (flags.zoom) {
+      // Every step's target at full size on one sheet: for small text, labels and states.
+      if (!sim) fail("Usage: simsites show <sim> --zoom");
+      const r = await onSimSites(p, "POST", `/api/projects/${p}/console`, { action: "zoom", sim }, { timeoutMs: 120000 });
+      if (JSON_OUT) return out(JSON.stringify({ ...r, file: r.file ? rel(r.file) : null }));
+      return out(r.file ? rel(r.file) : c.yellow("Nothing to zoom on: the sim has no step targets."));
+    }
+    if (flags.gif) {
+      // The film as an animated GIF: send it to the user where the client shows images, and it plays in the chat.
+      if (!sim) fail("Usage: simsites show <sim> --gif [--phone]");
+      const r = await onSimSites(p, "POST", `/api/projects/${p}/console`, { action: "gif", sim, ...(flags.phone ? { variant: "mobile" } : {}) }, { timeoutMs: 240000 });
+      if (JSON_OUT) return out(JSON.stringify({ ...r, file: rel(r.file) }));
+      return out(`${rel(r.file)}  ${c.dim(`(${r.frames} frames at ${r.fps} fps, ${(r.bytes / 1024 / 1024).toFixed(1)} MB)`)}`);
+    }
+    if (flags.term) {
+      // The film in this terminal: key frames as truecolor text (run it with `! simsites show <film> --term` in Claude Code).
+      if (!sim) fail("Usage: simsites show <sim> --term [--cols 100]");
+      const cols = Number(flags.cols) || Math.min(140, Math.max(60, (process.stdout.columns || 100) - 2));
+      if (await isHosted()) await syncDesign(p);
+      const r = await api("GET", `/api/projects/${p}/sims/${sim}/ansi?cols=${cols}${flags.max ? `&max=${Number(flags.max)}` : ""}`, undefined, { timeoutMs: 120000 });
+      out(`${c.bold(film.title)} ${c.dim(`${sim} · ${r.duration}s · ${film.status}`)}`);
+      for (const f of r.frames) {
+        out("");
+        out(f.ansi);
+        out(c.bold(f.label));
+      }
+      out("");
+      out(c.dim(`Play it: simsites show ${sim}  ·  ${url}`));
+      return;
+    }
+    let video = null;
+    if (flags.video && sim) {
+      await api("POST", `/api/projects/${p}/sims/${sim}`, { action: "export" });
+      progress("rendering the video …");
+      for (let i = 0; i < 300; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const st = await api("GET", `/api/projects/${p}/sims/${sim}`);
+        if (!st.export.running) {
+          video = st.export.url ? studioUrl() + st.export.url : null;
+          break;
+        }
+      }
+    }
+    if (!process.env.SIMSITES_NO_OPEN && !flags["no-open"]) {
+      try {
+        execFileSync(process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open", [url], { stdio: "ignore" });
+      } catch {}
+    }
+    if (JSON_OUT) return out(JSON.stringify({ url, video }));
+    out(url);
+    if (video) out(video);
+  },
+
+  /** Undo the last change to a film (back to the version before the last look that changed it). */
+  async undo() {
+    const sim = pos[0];
+    if (!sim) fail("Usage: simsites undo <sim-id>");
+    const p = currentProject();
+    const r = await onSimSites(p, "POST", `/api/projects/${p}/console`, { action: "undo", sim });
+    // The scene SimSites restored comes down into the design folder.
+    if (await isHosted()) await syncDesign(p, { quiet: true });
+    if (JSON_OUT) return out(JSON.stringify(r));
+    out(r.ok ? c.green("✓ ") + `Restored the previous version of ${sim}. Run simsites look ${sim} to see it.` : c.yellow("• ") + "Nothing to undo.");
+  },
+
+  /** Films of a console-designed feature: status, check score, open comments from the Review page. */
+  async films() {
+    const r = await api("GET", `/api/projects/${currentProject()}/console`);
+    if (JSON_OUT) return out(JSON.stringify(r));
+    if (!r.films.length) return out(c.dim("No sims yet (usecases.json is empty)."));
+    for (const f of r.films)
+      out(`  ${(STATUS[f.status] ?? f.status).padEnd(20)} ${f.title} ${c.dim(f.id)}${f.score != null ? c.dim(` · checks ${f.score}`) : f.hasScene ? c.yellow(" · not looked at") : c.dim(" · no scene")}${f.openComments ? c.yellow(` · ${f.openComments} comment${f.openComments === 1 ? "" : "s"}`) : ""}`);
+  },
+
+  /** Comments and requests from the Studio's Review page, waiting for Claude Code (console-designed features). */
+  async inbox() {
+    const p = currentProject();
+    if (flags.done) {
+      const r = await api("POST", `/api/projects/${p}/console`, { action: "done", ids: String(flags.done).split(","), note: flags.note ? String(flags.note) : undefined });
+      return out(JSON_OUT ? JSON.stringify(r) : c.green("✓ ") + `Closed ${r.done.length}.`);
+    }
+    const r = await api("GET", `/api/projects/${p}/console`);
+    if (JSON_OUT) return out(JSON.stringify(r.inbox));
+    if (!r.inbox.length) return out(c.dim("Nothing waiting."));
+    for (const i of r.inbox) {
+      const at = i.pick ? ` ${c.dim(`(pointing at ${i.pick.target ? i.pick.target : `"${(i.pick.text || "").slice(0, 40)}"`} at ${i.pick.t.toFixed(1)}s)`)}` : typeof i.t === "number" ? c.dim(` (at ${i.t.toFixed(1)}s)`) : "";
+      out(`${c.bold(i.id)} ${i.sim ?? ""} ${c.dim(i.kind)}${i.take ? c.dim(` take ${i.take}`) : ""}: ${i.text}${at}`);
+    }
+    out(c.dim(`Apply each, then: simsites look <sim> --note "what changed" --reply <ids>`));
+  },
+
+  /** Linear issues waiting for sims in your teams (labelled "sims"): start one with simsites design --issue <id>. */
+  async next() {
+    await ensureStudio();
+    const r = await api("GET", "/api/linear/queue");
+    if (JSON_OUT) return out(JSON.stringify(r.issues));
+    if (!r.issues.length) return out(c.dim("No Linear issues waiting for sims."));
+    for (const i of r.issues) out(`${c.bold(i.identifier)} ${i.title} ${c.dim(`· ${i.team} · ${i.url}`)}`);
+    out(c.dim("Start one: /simsites <identifier> in Claude Code (simsites design --issue <identifier>)."));
+  },
+
+  /** A share link to the feature's sims: anyone with it comments and approves (or, --watch-only, only watches). */
+  async share() {
+    const p = currentProject();
+    await ensureStudio();
+    if (!(await isHosted())) fail("Share links are on the hosted SimSites.");
+    const r = await api("POST", `/api/projects/${p}/share`, { role: flags["watch-only"] ? "viewer" : "reviewer" });
+    if (JSON_OUT) return out(JSON.stringify(r.link));
+    out(r.link.url);
+    out(c.dim(r.link.role === "viewer" ? "Anyone with this link watches the sims (no account needed)." : "Anyone with this link watches, comments and approves (no account needed). Turn it off on the watch page (Share)."));
+  },
+
+  /** Bring the current feature's design folder in step with SimSites (on another computer, after a clone). */
+  async pull() {
+    const p = currentProject();
+    await ensureStudio();
+    if (!(await isHosted())) fail("pull is for the hosted SimSites.");
+    const r = await syncDesign(p);
+    if (JSON_OUT) return out(JSON.stringify({ ok: true, up: r.up, down: r.down }));
+    out(c.green("✓ ") + `${p}: ${r.down.length} file${r.down.length === 1 ? "" : "s"} from SimSites, ${r.up.length} sent.`);
+  },
+
+  /** Old local Studio only: link this repo's design folders (.simsites/design/*) to it after a clone. */
+  async attach() {
+    await ensureStudio();
+    if (await isHosted()) return commands.pull();
+    const r = await api("POST", "/api/projects/attach", { repo: ROOT });
+    if (r.attached.length) saveRepo({ features: [...new Set([...(repoConfig()?.features ?? []), ...r.attached])] });
+    if (JSON_OUT) return out(JSON.stringify(r));
+    if (!r.attached.length && !r.skipped.length) return out(c.dim("Nothing to attach: every design folder is already known to the Studio."));
+    for (const id of r.attached) out(c.green("✓ ") + `Attached ${id}`);
+    for (const s of r.skipped) out(c.yellow("• ") + `${s.id}: ${s.reason}`);
+  },
+
+  /** Capture the app's screens again (after starting the dev server, or for a new route). */
+  async recapture() {
+    const p = currentProject();
+    const r = (await isHosted()) ? { capture: await captureLocal(p, { routes: repoConfig()?.routes }) } : await api("POST", `/api/projects/${p}/console`, { action: "recapture" }, { timeoutMs: 300000 });
+    if (JSON_OUT) return out(JSON.stringify(r.capture));
+    out(r.capture?.reached ? c.green("✓ ") + `Captured ${r.capture.reached} of ${r.capture.total} screens.` : c.yellow("• ") + "The app still isn't reachable.");
+  },
+
+  /** New controls the films show that no film demonstrates: film them, make them plain text, or ignore them. */
+  async coverage() {
+    const p = currentProject();
+    if (flags.ignore) {
+      // Several at once: --ignore film:key,film:key (keys themselves contain ":", so split on commas first).
+      const items = String(flags.ignore).split(",").map((x) => x.trim()).filter(Boolean);
+      for (const item of items) {
+        const [sim, ...key] = item.split(":");
+        await api("POST", `/api/projects/${p}/console`, { action: "ignore", sim, key: key.join(":"), note: flags.note ? String(flags.note) : undefined });
+      }
+      return out(JSON_OUT ? JSON.stringify({ ok: true, ignored: items.length }) : c.green("✓ ") + `Ignored ${items.length}.`);
+    }
+    const r = await api("POST", `/api/projects/${p}/console`, { action: "coverage" }, { timeoutMs: 180000 });
+    if (JSON_OUT) return out(JSON.stringify(r.uncovered));
+    if (!r.uncovered.length) return out(c.green("✓ ") + "Every new control in the sims is demonstrated by a sim.");
+    out(c.yellow(`${r.uncovered.length} new control${r.uncovered.length === 1 ? "" : "s"} no sim demonstrates:`));
+    for (const u of r.uncovered) out(`  ${u.sim}:${u.key}  ${c.dim(`${u.kind} "${u.label}" at ${u.t.toFixed(1)}s`)}`);
+    out(c.dim(`Each: add a sim for it (or a step in one), make it plain text if it's decorative, or: simsites coverage --ignore <sim:key> --note "why"`));
+  },
+
+  /** Kept for scripts (exit code 2 on errors) but not listed: `look` runs the same checks and shows the film. */
+  async check() {
+    const p = currentProject();
+    const sim = pos[0];
+    if (!sim) fail("Usage: simsites check <sim-id> [--take N]");
+    const r = await api("GET", `/api/projects/${p}/sims/${sim}/check${flags.take ? `?take=${Number(flags.take)}` : ""}`, undefined, { timeoutMs: 120000 });
+    if (JSON_OUT) return out(JSON.stringify(r));
+    out(`${sim}: ${r.score}/100`);
+    for (const x of r.checks) out(`  ${x.level === "error" ? c.red("✗") : c.yellow("⚠")} ${x.message}`);
+    if (r.checks.some((x) => x.level === "error")) process.exitCode = 2;
+  },
+});
+
+/**
+ * SessionStart hook: features of this repo still in flight (films to review, comments waiting, approved but not built),
+ * so a new session picks up where the last one stopped. Silent when there's nothing, or no Studio.
+ */
+async function sessionHook() {
+  try {
+    const cfg = repoConfig();
+    const ids = [...new Set([cfg?.current, ...[...(cfg?.features ?? [])].reverse()].filter(Boolean))].slice(0, 5);
+    const lines = [];
+    // Linear issues waiting for sims in the developer's teams (hosted, a team that connected Linear).
+    const queue = await studioFetch(`/api/linear/queue`, { signal: AbortSignal.timeout(1500) })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    const waiting = (queue?.issues ?? []).slice(0, 5);
+    if (waiting.length)
+      out(`Linear issues waiting for sims (mention them only if relevant; start one with /simsites <identifier>):\n${waiting.map((i) => `- ${i.identifier} ${i.title} (${i.team})`).join("\n")}`);
+    if (!ids.length) return;
+    const summaries = await Promise.all(
+      ids.map((id) =>
+        studioFetch(`/api/projects/${id}/summary`, { signal: AbortSignal.timeout(1500) })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => undefined),
+      ),
+    );
+    if (summaries.every((x) => x === undefined)) return;
+    for (const [k, id] of ids.entries()) {
+      const s = summaries[k];
+      if (!s) continue;
+      const films = s.useCases ?? [];
+      const approved = films.filter((u) => u.status === "approved").length;
+      const handedOff = existsSync(path.join(ROOT, ".simsites", id, "manifest.json"));
+      const verified = existsSync(path.join(ROOT, ".simsites", id, "verify-report.json"));
+      if (!films.length || (handedOff && verified && approved === films.length && !(s.inbox ?? []).length)) continue;
+      const state = [
+        `${films.length} film${films.length === 1 ? "" : "s"}, ${approved} approved`,
+        (s.inbox ?? []).length ? `${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"} from the Studio waiting` : null,
+        approved === films.length && !handedOff ? "approved but not built yet" : null,
+        handedOff && !verified ? "handed off, not verified yet" : null,
+      ].filter(Boolean);
+      lines.push(`- ${s.project.title} (--project ${id}): ${state.join(" · ")}`);
+    }
+    if (lines.length)
+      out(`SimSites features in flight in this repo (mention them only if relevant; simsites status for details):\n${lines.join("\n")}`);
+  } catch {}
+}
+
+/** Approvals made from this conversation: the prompt hook only announces the ones made on the Review page. */
+function rememberApproved(id, films) {
+  const file = path.join(ROOT, ".simsites", ".hook-state.json");
+  const state = readJson(file, {});
+  if (!state[id]) return; // no baseline yet: the hook's first look records it
+  state[id].approved = [...new Set([...(state[id].approved ?? []), ...films])];
+  writeFileSync(file, JSON.stringify(state) + "\n");
+}
+
+/**
+ * UserPromptSubmit hook: what happened on the Studio's Review page since the last message — comments waiting for
+ * Claude Code, films approved there — added to Claude's context. Silent (and network-free) in repos without a
+ * SimSites feature; never fails the prompt.
+ */
+/** `simsites version`: the plugin (this folder) and the Studio it talks to. */
+commands.version = async () => {
+  const pkg = readJson(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json"), {});
+  const health = await studioFetch(`/api/health`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json()).catch(() => null);
+  out(`plugin ${pkg.version ?? "?"} (${path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")})`);
+  out(health ? `SimSites ${studioUrl()} · ${health.features?.join(", ")}` : c.yellow(`SimSites didn't answer at ${studioUrl()}`));
+};
+
+// `simsites sims` = `simsites films` (sims were called films).
+commands.sims = (...args) => commands.films(...args);
+// `simsites watch` = `simsites show`: the watch page for the user.
+commands.watch = (...args) => commands.show(...args);
+
+/**
+ * PreToolUse hook on AskUserQuestion: an approval question blocks the conversation, so approvals and comments made on
+ * the watch page meanwhile reach nobody. While sims wait for approval, turn it into a background wait + a plain reply.
+ */
+async function askHook() {
+  try {
+    let raw = "";
+    for await (const chunk of process.stdin) raw += chunk;
+    const input = JSON.parse(raw || "{}");
+    const qs = input.tool_input?.questions ?? [];
+    const text = qs.map((q) => [q.question, q.header, ...(q.options ?? []).map((o) => o.label)].join(" ")).join(" ");
+    if (!/approv/i.test(text)) return;
+    const cfg = repoConfig();
+    const ids = [...new Set([cfg?.current, ...[...(cfg?.features ?? [])].reverse()].filter(Boolean))].slice(0, 3);
+    for (const id of ids) {
+      const s = await studioFetch(`/api/projects/${id}/summary`, { signal: AbortSignal.timeout(1500) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      if (!s || s.project.designer !== "claude-code") continue;
+      if (!s.useCases.some((u) => u.hasScene && u.status !== "approved")) continue;
+      return out(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason:
+              `SimSites: don't ask for approval with a question — it blocks this conversation, and what the user does on the watch page can't reach you while it's open. ` +
+              `Instead: run \`simsites wait --until decision --json --project ${id}\` in the background (run_in_background), then end your reply with a plain-text line ` +
+              `such as "Approve them on the watch page, or tell me here which ones are ready / what to change", followed by ▶ [Watch and approve the sims](${s.watchUrl}) as the last line.`,
+          },
+        }),
+      );
+    }
+  } catch (err) {
+    if (process.env.SIMSITES_DEBUG) console.error(err);
+  }
+}
+
+commands.hook = async () => {
+  if (pos[0] === "session") return sessionHook();
+  if (pos[0] === "ask") return askHook();
+  try {
+    const cfg = repoConfig();
+    // The current feature and the two started most recently.
+    const ids = [...new Set([cfg?.current, ...[...(cfg?.features ?? [])].reverse()].filter(Boolean))].slice(0, 3);
+    if (!ids.length) return;
+    const stateFile = path.join(ROOT, ".simsites", ".hook-state.json");
+    const state = readJson(stateFile, {});
+    const notes = [];
+    // All features at once: this runs before every message the user sends.
+    const summaries = await Promise.all(
+      ids.map((id) =>
+        studioFetch(`/api/projects/${id}/summary`, { signal: AbortSignal.timeout(1500) })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => undefined),
+      ),
+    );
+    if (summaries.every((x) => x === undefined)) return; // Studio not running: nothing to say
+    for (const [k, id] of ids.entries()) {
+      const s = summaries[k];
+      if (!s) continue;
+      const first = !state[id];
+      const seen = state[id] ?? { inbox: [], approved: [] };
+      const inbox = (s.inbox ?? []).filter((i) => !seen.inbox.includes(i.id));
+      const approved = s.useCases.filter((u) => u.status === "approved").map((u) => u.id);
+      const newlyApproved = approved.filter((a) => !seen.approved.includes(a));
+      if (inbox.length)
+        notes.push(
+          `SimSites (${id}): ${inbox.length} request${inbox.length === 1 ? "" : "s"} from the Studio waiting for you:\n` +
+            inbox.map((i) => `- ${i.id} [${i.sim ?? "feature"}${i.kind !== "comment" ? `, ${i.kind}${i.take ? ` ${i.take}` : ""}` : ""}]: ${i.text}`).join("\n") +
+            `\nApply them after answering the user (simsites inbox --project ${id} shows where each points), then simsites look <sim> --note "…" --reply <ids>.`,
+        );
+      // The first look at a feature is the baseline: approvals before it were made in this conversation.
+      if (newlyApproved.length && s.project.repo && !first) {
+        const all = s.useCases.length > 0 && approved.length === s.useCases.length;
+        notes.push(`SimSites (${id}): approved in the Studio: ${newlyApproved.join(", ")}.${all ? ` Every sim is approved — build it (simsites handoff --project ${id}, then build it from the /simsites skill's build.md) unless the user says otherwise.` : ""}`);
+      }
+      // Sims waiting for the user's decision: how they see them is the watch link, never GIFs in the chat.
+      const waiting = s.useCases.filter((u) => u.hasScene && u.status !== "approved").length;
+      if (waiting && s.project.designer === "claude-code" && s.watchUrl)
+        notes.push(
+          `SimSites (${id}): ${waiting} sim${waiting === 1 ? "" : "s"} waiting for the user's approval. When your reply is about them, end it with ▶ [Watch and approve the sims](${s.watchUrl}) — no GIFs or images.` +
+            (s.listening ? "" : ` Nothing is listening to the watch page: start \`simsites wait --until decision --json --project ${id}\` in the background so what the user does there reaches you right away.`),
+        );
+      state[id] = { inbox: (s.inbox ?? []).map((i) => i.id), approved };
+    }
+    mkdirSync(path.dirname(stateFile), { recursive: true });
+    writeFileSync(stateFile, JSON.stringify(state) + "\n");
+    if (notes.length) out(notes.join("\n\n"));
+  } catch (err) {
+    if (process.env.SIMSITES_DEBUG) console.error(err);
+  }
+};
+
+commands.pull = commands.handoff;
+
+/** Run verify for one feature in the background and follow its log, so a long replay shows each step as it happens. */
+async function runVerify(p) {
+  if (await isHosted()) return verifyHere(p);
+  const before = await api("GET", `/api/projects/${p}/build`);
+  const seen = new Set(before.log.map((e) => `${e.run}|${e.at}|${e.summary ?? e.type}`));
+  await api("POST", `/api/projects/${p}/build`, { action: "verify" });
+  const deadline = Date.now() + 15 * 60000;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const b = await api("GET", `/api/projects/${p}/build`);
+    for (const e of b.log.filter((e) => e.job === "verify")) {
+      const key = `${e.run}|${e.at}|${e.summary ?? e.type}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (e.type === "tool" && e.summary) progress(e.summary);
+      if (e.type === "done" && e.ok === false) fail(e.error || "Verification failed to run");
+    }
+    if (!b.verifying) {
+      if (!b.report) fail("Verification finished without a report.");
+      return b.report;
+    }
+    if (Date.now() > deadline) fail("Verification is still running after 15 minutes — check the Studio's build page.");
+  }
+}
+
+/**
+ * Verify on this machine (hosted SimSites): replay the hand-off's approved sims against the dev server with the
+ * runner (plugin/runner/verify.mjs), then put the report and its screenshots on SimSites for the Review page.
+ */
+async function verifyHere(p) {
+  const cfg = repoConfig();
+  if (!cfg) fail("Link the repo first: simsites init");
+  const exportDir = path.join(ROOT, ".simsites", p);
+  if (!existsSync(path.join(exportDir, "manifest.json"))) fail("Nothing handed off yet — run simsites handoff first.");
+  const { chromium } = await loadPlaywright();
+  const { runVerify: replay } = await import(pathToFileURL(path.join(PLUGIN_DIR, "runner", "verify.mjs")).href);
+  const designDir = designDirOf(p);
+  // Progress for the Review page's timeline, never in the way of the run.
+  let last = 0;
+  const report = (body) => api("POST", `/api/projects/${p}/build`, body, { soft: true, timeoutMs: 10000 });
+  let result = null;
+  const pending = [];
+  const { report: rep } = await replay({
+    project: p,
+    root: ROOT,
+    designDir,
+    exportDir,
+    // --dev-url: another address of the app (CI: the pull request's preview deploy).
+    repo: { path: ROOT, name: path.basename(ROOT), devUrl: String(flags["dev-url"] || cfg.devUrl).replace(/\/+$/, ""), routes: cfg.routes ?? ["/"], ...(cfg.resetCommand ? { resetCommand: cfg.resetCommand } : {}) },
+    chromium,
+    say: (x) => !JSON_OUT && progress(x),
+    phase: (ph, patch) => {
+      if (ph === "verifying") pending.push(report({ action: "verifying", done: 0, total: patch.verify?.total ?? 0 }));
+      if (ph === "done") result = patch.result ?? null;
+    },
+    count: (done, total) => {
+      if (Date.now() - last < 2000) return;
+      last = Date.now();
+      pending.push(report({ action: "verifying", done, total }));
+    },
+  }).catch((err) => fail(err instanceof Error ? err.message : String(err)));
+  await Promise.all(pending);
+  // The runner keeps one browser for the run (lib/frames): close it, or this process never ends.
+  const runnerBrowser = await globalThis.__simBrowser?.catch(() => null);
+  await runnerBrowser?.close().catch(() => {});
+  globalThis.__simBrowser = undefined;
+  // The commit this ran on: a pull request's SimSites check looks for a verify of its head commit.
+  const { sha, dirty, branch } = gitInfo();
+  rep.git = { sha, dirty, branch };
+  // The screenshots the report points at (verify/…), for the Review page's built-vs-approved pairs.
+  const shots = walkFiles(path.join(designDir, "verify")).map((rel) => `verify/${rel}`);
+  for (let i = 0; i < shots.length; i += 6) await Promise.all(shots.slice(i, i + 6).map((rel) => upload(p, rel, readFileSync(path.join(designDir, rel)))));
+  const sent = await report({ action: "verified", report: rep, result: result ?? { ok: rep.ok, passed: 0, total: 0, different: 0 } });
+  if (sent?.error && !JSON_OUT) progress(`couldn't put the report on SimSites: ${sent.error}`);
+  return rep;
+}
+
+function printReport(rep, indent = "", compact = false) {
+  for (const cse of rep.cases) {
+    const skipped = cse.steps.filter((s) => s.skipped).length;
+    const passed = cse.steps.filter((s) => s.ok && !s.skipped).length;
+    out(
+      `${indent}${cse.ok ? c.green("✓") : c.red("✗")} ${cse.title} ${c.dim(`${cse.route || "no route"} · ${passed}/${cse.steps.length - skipped} steps${skipped ? ` (${skipped} not on the phone)` : ""}`)}`,
+    );
+    if (cse.error) out(c.red(`${indent}    ${cse.error}`));
+    for (const s of cse.steps.filter((s) => s.ok === false)) out(c.red(`${indent}    ${s.step.do} [data-sim="${s.step.target}"]: ${s.error}`));
+    if (cse.persistence && !cse.persistence.ok) out(c.red(`${indent}    lost after reload: ${cse.persistence.targets.join(", ")}`));
+  }
+  // Passing steps can still look wrong (styles not loaded, a component that differs): the match score says so.
+  const different = lookDifferent(rep);
+  if (different.length && compact) {
+    out(c.yellow(`${indent}⚠ ${different.length} step${different.length === 1 ? "" : "s"} look different (lowest ${Math.round(different[0].similarity * 100)}%) — VERIFY.md`));
+  } else if (different.length) {
+    out(c.yellow(`${indent}⚠ ${different.length} step${different.length === 1 ? "" : "s"} look different from the approved sim:`));
+    for (const d of different.slice(0, 6)) out(c.yellow(`${indent}    ${d.title}, step ${d.n} (${d.do} ${d.target}): ${Math.round(d.similarity * 100)}% match`));
+    out(c.dim(`${indent}  Compare the pairs listed in VERIFY.md. A low match everywhere usually means new CSS isn't loaded yet.`));
+  } else if (!compact) {
+    // Every step matches the layout — the pairs still need a look (fonts, colours, copy aren't in the score).
+    const scored = rep.cases.flatMap((cse) => cse.steps.filter((s) => s.similarity != null && !s.skipped).map((s) => s.similarity));
+    if (scored.length) {
+      // The layout score compares boxes only: colours, fonts and copy can differ at 100%.
+      const lo = Math.min(...scored);
+      out(
+        c.dim(
+          `${indent}Visual pass: ${scored.length} pairs (sim | app), layout ${Math.round(lo * 100)}–${Math.round(Math.max(...scored) * 100)}% — ` +
+            (lo >= 0.97
+              ? "the boxes match; read one pair per sim (verify/<sim>/*-pair.jpg, listed in VERIFY.md) for colours, fonts and copy."
+              : "read verify/<sim>/*-pair.jpg (listed in VERIFY.md), lowest first, and fix what looks different."),
+        ),
+      );
+    }
+  }
+  if (rep.api?.tests?.length) out(`${indent}${rep.api.ok ? c.green("✓") : c.red("✗")} API contract ${c.dim(`${rep.api.tests.filter((t) => t.ok).length}/${rep.api.tests.length}`)}`);
+}
+
+/** Steps whose screenshot doesn't match the approved film's frame (same threshold as VERIFY.md), lowest first. */
+function lookDifferent(rep) {
+  return rep.cases
+    .flatMap((cse) => cse.steps.map((s, i) => ({ title: cse.title, n: i + 1, do: s.step.do, target: s.step.target ?? "", similarity: s.similarity, skipped: s.skipped })))
+    .filter((s) => !s.skipped && s.similarity != null && s.similarity < 0.9)
+    .sort((a, b) => a.similarity - b.similarity);
+}
+
+/**
+ * Replay every handed-off feature of this repo: the approved films are a regression suite. A failure in an older
+ * feature is either a regression (fix the app) or an intended change (update that film and approve it again).
+ */
+async function verifyAll() {
+  const approvedHere = (id) => readJson(path.join(ROOT, ".simsites", id, "manifest.json"), null)?.sims?.some((s) => s.status === "approved");
+  // Hosted: the features whose hand-off is committed here (CI checks out the repo anywhere); SimSites knows them by id.
+  // Drafts (handoff --drafts) aren't a spec yet.
+  const mine = (await isHosted())
+    ? (existsSync(path.join(ROOT, ".simsites")) ? readdirSync(path.join(ROOT, ".simsites"), { withFileTypes: true }) : [])
+        .filter((d) => d.isDirectory() && d.name !== "design" && approvedHere(d.name))
+        .map((d) => ({ id: d.name, title: readJson(path.join(ROOT, ".simsites", d.name, "manifest.json"), {}).title ?? d.name }))
+    : (await api("GET", "/api/projects")).filter((p) => p.repo?.path === ROOT && approvedHere(p.id));
+  // Nothing approved and handed off yet: nothing to replay, which isn't a failure.
+  if (!mine.length) return out(JSON_OUT ? JSON.stringify({ ok: true, features: [] }) : c.dim("Nothing to replay yet: no feature of this repo has been handed off."));
+  const results = [];
+  for (const p of mine) {
+    if (!JSON_OUT) out(c.bold(p.title) + c.dim(` (${p.id})`));
+    const rep = await runVerify(p.id);
+    results.push({ id: p.id, title: p.title, ok: rep.ok, report: rep });
+    if (!JSON_OUT) printReport(rep, "  ", true);
+  }
+  const failed = results.filter((r) => !r.ok);
+  if (JSON_OUT) {
+    out(JSON.stringify({ ok: !failed.length, features: results }));
+    process.exit(failed.length ? 1 : 0);
+  }
+  out("");
+  if (!failed.length) return out(c.green(`All ${results.length} features pass.`));
+  out(c.red(`${failed.length} of ${results.length} features fail: ${failed.map((f) => f.id).join(", ")}.`));
+  out(c.dim("A regression → fix the app. An intended change → update that sim's scene, simsites look it, and ask the user to approve it again."));
+  process.exit(1);
+}
+
+/** After the build: block until the reviewer sends a new fix request from Built vs approved (or the timeout). */
+async function waitForFixes(p) {
+  const deadline = Date.now() + Number(flags.timeout || 3600) * 1000;
+  const openIds = async () => new Set((await api("GET", `/api/projects/${p}/fixes`)).fixes.filter((f) => f.status === "open").map((f) => f.id));
+  const known = await openIds();
+  progress(`waiting for fix requests from the Studio (${known.size} open)`);
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 4000));
+    // A slow or failed poll (a hosted SimSites' cold start) is retried, not the end of the wait.
+    const r = await api("GET", `/api/projects/${p}/fixes`, undefined, { soft: true, timeoutMs: 60000 });
+    if (r.error || !Array.isArray(r.fixes)) {
+      if (Date.now() > deadline) fail(`${r.error ?? "the Studio sent an unexpected answer"}.`);
+      continue;
+    }
+    const now = new Set(r.fixes.filter((f) => f.status === "open").map((f) => f.id));
+    const fresh = [...now].filter((id) => !known.has(id));
+    if (fresh.length || Date.now() > deadline) {
+      const open = r.fixes.filter((f) => f.status === "open");
+      if (JSON_OUT) return out(JSON.stringify({ reason: fresh.length ? "fixes" : "timeout", fresh, open }));
+      if (!fresh.length) return out(c.dim("No new fix requests."));
+      for (const f of open.filter((f) => fresh.includes(f.id))) out(`${c.bold(f.id)} ${f.sim} · step ${f.step}: ${f.message}`);
+      out(c.dim(`\nDetails and screenshots: .simsites/${p}/FIXES.md`));
+      return;
+    }
+  }
+}
+
+/**
+ * Wait for the user, on the watch or Review page:
+ *   --until approved (default)  every sim approved, or a comment / take request / changed decision arrives
+ *   --until decision            the first thing the user does: a comment, an approval or an approval taken back
+ *   --until fixes               after the build: the next fix request on a built-vs-approved pair
+ * While it runs, the watch page says Claude Code is listening. A Studio that doesn't answer (restarting) is waited out.
+ */
+/** This computer's name for the watch page ("Claude Code is listening, on Yannick's MacBook"). */
+/**
+ * The claude.ai/code link of the Claude Code session running this, when it has one: a session connected to claude.ai
+ * (Remote Control, e.g. the desktop app's "Connect new sessions to Remote Control") or a cloud session. The watch
+ * page's "Open Claude Code" sends people there once everything is approved.
+ */
+function claudeSessionUrl() {
+  const id = process.env.CLAUDE_CODE_BRIDGE_SESSION_ID || process.env.CLAUDE_CODE_REMOTE_SESSION_ID?.replace(/^cse_/, "session_");
+  return id && /^session_[A-Za-z0-9]+$/.test(id) ? `https://claude.ai/code/${id}` : "";
+}
+
+function deviceName() {
+  if (process.platform === "darwin") {
+    try {
+      return execFileSync("scutil", ["--get", "ComputerName"], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    } catch {}
+  }
+  return hostname();
+}
+
+async function repoWait(p) {
+  const until = String(flags.until || "approved");
+  if (until === "fixes") return waitForFixes(p);
+  const deadline = Date.now() + Number(flags.timeout || 3600) * 1000;
+  let last = "";
+  let startApproved = null;
+  // ?listening: the watch page tells the user that what they do there reaches Claude Code right away.
+  const listening = `listening=1&device=${encodeURIComponent(deviceName())}${claudeSessionUrl() ? `&claude=${encodeURIComponent(claudeSessionUrl())}` : ""}`;
+  let version;
+  for (;;) {
+    // Hosted: a cheap version check first; the summary only when something changed (or on the first round).
+    if (version !== undefined) {
+      const st = await api("GET", `/api/projects/${p}/status?${listening}`, undefined, { soft: true, timeoutMs: 60000 });
+      if (!st.error && typeof st.version === "string" && st.version === version) {
+        if (Date.now() > deadline) version = undefined; // one last full look, which then times out
+        else {
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
+        }
+      } else if (!st.error && typeof st.version === "string") version = st.version;
+    } else {
+      const st = await api("GET", `/api/projects/${p}/status`, undefined, { soft: true, timeoutMs: 60000 });
+      version = typeof st.version === "string" ? st.version : null; // null: a local Studio, no versions
+    }
+    let s = await api("GET", `/api/projects/${p}/summary?${listening}`, undefined, { soft: true, timeoutMs: 60000 });
+    // A hosted SimSites can answer a cold start or a hiccup with something that isn't a summary: retry, don't crash.
+    if (!s.error && !Array.isArray(s.useCases)) s = { error: "the Studio sent an unexpected answer" };
+    if (s.error) {
+      if (s.error !== last) progress(`${s.error} — still waiting`);
+      last = s.error;
+      if (Date.now() > deadline) fail(`${s.error}.`);
+      await new Promise((r) => setTimeout(r, 4000));
+      continue;
+    }
+    const films = s.useCases;
+    const approvedNow = films.filter((u) => u.status === "approved").map((u) => u.id);
+    const approved = approvedNow.length;
+    startApproved ??= approvedNow;
+    const newlyApproved = approvedNow.filter((id) => !startApproved.includes(id));
+    const unapproved = startApproved.filter((id) => !approvedNow.includes(id));
+    const line = `${films.length} sims · ${approved} approved${s.inbox?.length ? ` · ${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"}` : ""}`;
+    if (line !== last) progress(line);
+    last = line;
+
+    let reason = null;
+    // Comments and requests from the Studio wake Claude Code (its inbox must be empty to wait).
+    if (s.inbox?.length) reason = "feedback";
+    else if (films.length && approved === films.length) reason = "approved";
+    else if (until === "decision" && (newlyApproved.length || unapproved.length)) reason = "decision";
+    if (!reason && Date.now() > deadline) reason = "timeout";
+    if (!reason) {
+      await new Promise((r) => setTimeout(r, 4000));
+      continue;
+    }
+    const waiting = films.filter((u) => u.status !== "approved").map((u) => u.id);
+    const result = {
+      reason,
+      watchUrl: s.watchUrl,
+      films: films.map((u) => ({ id: u.id, title: u.title, goal: u.goal, status: u.status })),
+      approved,
+      ...(reason === "decision" || reason === "approved" ? { newlyApproved, unapproved, waiting } : {}),
+      ...(reason === "decision" ? { note: "Tell the user in one line what you saw (approved / taken back), then start this wait again in the background while sims still wait." } : {}),
+      ...(reason === "feedback" ? { inbox: s.inbox, note: "Apply each request to its sim, then: simsites look <sim> --note \"what changed\" --reply <ids>. Then wait again." } : {}),
+      ...(reason === "timeout" ? { note: "Nothing happened yet: start the wait again." } : {}),
+    };
+    if (JSON_OUT) return out(JSON.stringify(result));
+    out("");
+    for (const f of films) out(`  ${(STATUS[f.status] ?? f.status).padEnd(20)} ${f.title} ${c.dim(f.id)}`);
+    if (reason === "approved") out(c.green(`\n→ Everything is approved. Next: simsites handoff, then build it.`));
+    else if (reason === "decision") {
+      if (newlyApproved.length) out(c.green(`\n→ Approved on the watch page: ${newlyApproved.join(", ")}`));
+      if (unapproved.length) out(c.yellow(`\n→ Approval taken back: ${unapproved.join(", ")}`));
+      out(c.dim(`${approved}/${films.length} approved. Start the wait again (in the background) while sims still wait.`));
+    } else if (reason === "feedback") {
+      out(c.yellow(`\n${s.inbox.length} request${s.inbox.length === 1 ? "" : "s"} from the Studio:`));
+      for (const i of s.inbox) out(`  ${c.bold(i.id)} ${i.sim ?? ""} ${c.dim(i.kind)}: ${i.text}`);
+      out(c.dim(`Apply each, then: simsites look <sim> --note "what changed" --reply <ids>`));
+    } else out(c.dim(`\n→ Still waiting (${approved}/${films.length} approved). Watch: ${s.watchUrl}`));
+    return;
+  }
+}
+
+// A bug in the CLI itself: say so plainly, and report it.
+for (const ev of ["uncaughtException", "unhandledRejection"])
+  process.on(ev, (err) => fail(`SimSites hit a bug: ${err?.stack || err}. It has been reported; try again, or tell the SimSites team.`));
+
+const fn = commands[cmd];
+if (!fn) fail(`Unknown command: ${cmd}. Run: simsites help`);
+// `simsites <command> --help` only prints the help.
+if (flags.help || flags.h || pos.includes("-h")) {
+  await commands.help();
+  process.exit(0);
+}
+await fn();
+reportRun(true);
+// The engine's browser and local server would keep this process alive: close them and finish.
+if (engineReady) {
+  const { engine, server } = await engineReady;
+  await engine.shutdown();
+  server.close();
+  process.exit(0);
+}
