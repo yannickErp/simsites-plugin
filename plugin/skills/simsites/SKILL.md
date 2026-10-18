@@ -30,9 +30,12 @@ If no feature was given above and the conversation has none, ask what they want 
 
 ## 1. Set up (silent unless something is missing)
 
-- Nothing to start: SimSites is a website. A command that says "Sign in to SimSites first" → tell the user to make a
-  token on SimSites' settings page and run `simsites auth <token>` themselves, then stop. The first capture or verify
-  on a machine installs Playwright (a minute, once).
+- Nothing to start: SimSites is a website. A command that says "Sign in to SimSites first" → tell the user to click
+  **Create token and copy command** on the SimSites dashboard (or Settings → CLI tokens) and paste the
+  `! simsites auth …` line it copies into this chat themselves, then stop.
+- The first `simsites design` on a computer downloads Playwright and a browser (~150 MB): run it with a 10-minute
+  timeout (`timeout: 600000`). If it was stopped part-way, run `simsites list` and continue a feature it already
+  created instead of starting another one.
 - `.simsites/config.json` missing → `simsites init` (add `--routes /a,/b` for screens the feature touches; dynamic
   routes need a concrete path; `--routes` replaces the list, so keep the existing ones). Signed-in screens → `simsites login /login` and let the user sign in themselves.
 - The dev server must answer: `curl -s -o /dev/null -w "%{http_code}" <devUrl>`; if not, start `devCommand` from the
@@ -51,7 +54,11 @@ them later as assumptions.
 `simsites design --json --title "<the feature's name, 2–5 words>" "<the request in the user's words + what you learnt>"`
 (add `--ref <file>,…` for mockups or screenshots the user gave you) → returns `designDir` (`.simsites/design/<id>/`), the
 screenshots it just took, and `id`. Pass `--project <id>` to
-every later command (other sessions may run other features).
+every later command (other sessions may run other features). If it says the plan's features in progress are used up,
+show the user the features it names and ask which to put away (`simsites cancel --project <id>`) — never pick one
+yourself. If the result has `reached: false`, the app didn't answer: compare `devUrl` in `.simsites/config.json`
+with the address the dev server prints, fix it with `simsites init --dev-url <url>`, start the server, then
+`simsites recapture --project <id>`. Don't start a new feature for it.
 
 Read `CONTRACT.md` (the scene rules), `references/notes.md` (each screen's text, controls, existing data-sim ids and
 the app's computed fonts/colours/radii) and the screenshots of the screens you'll sim. Read
@@ -208,8 +215,10 @@ Tell the user what you built and both verify results.
   `[placeholder]` and list it as an assumption.
 - Keep sims short (8–20s), one use case each, starting from a real route with the app's real data.
 - `simsites help` lists the commands (`simsites list` shows this repo's features, `simsites use <id>` switches).
-- A feature started by mistake: `simsites cancel --project <id>`.
+- A feature started by mistake: `simsites cancel --project <id>`. Put away by mistake: `simsites restore --project <id>`.
 - The design folder is kept in step with SimSites by the CLI: edit files there as usual, and never copy files into
   or out of it by hand. On another computer, `simsites pull` brings a feature's folder over.
-- A command that fails because SimSites isn't reachable or needs its render worker: don't retry it in a loop or work
+- Something about the setup doesn't work (sign-in, the dev server, the browser): run `simsites doctor`, which names
+  what's missing and how to fix it; tell the user the fix in one line.
+- A command that fails because SimSites isn't reachable: don't retry it in a loop or work
   around it. Tell the user in one line what couldn't run, and carry on with what works.

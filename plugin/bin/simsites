@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // simsites — use SimSites from any repo: simulate a feature first, then let Claude Code build it.
-// No dependencies (Node 18+). Talks to the hosted SimSites over HTTP; captures your app and verifies the build here,
+// No dependencies (Node 20+ recommended, 18 works). Talks to the hosted SimSites over HTTP; captures your app and verifies the build here,
 // with Playwright (installed into ~/.simsites/runner the first time it's needed).
 
 import { execFileSync, spawn } from "node:child_process";
@@ -12,6 +12,24 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOME_DIR = path.join(homedir(), ".simsites");
 const HOME_CONFIG = path.join(HOME_DIR, "config.json");
+
+if (Number(process.versions.node.split(".")[0]) < 18) {
+  console.error(`simsites needs Node.js 20 or newer (this is ${process.version}). Install it from https://nodejs.org, then try again.`);
+  process.exit(1);
+}
+
+// Behind a proxy (HTTPS_PROXY), Node's fetch only uses it when told to: run again, told so — the dev server on this
+// machine still goes direct.
+const proxied = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+if (proxied && !process.env.NODE_USE_ENV_PROXY && !process.env.SIMSITES_NO_PROXY_RERUN) {
+  const { spawnSync } = await import("node:child_process");
+  const noProxy = [process.env.NO_PROXY || process.env.no_proxy, "localhost", "127.0.0.1", "::1"].filter(Boolean).join(",");
+  const r = spawnSync(process.execPath, ["--no-warnings", ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: { ...process.env, NODE_USE_ENV_PROXY: "1", NO_PROXY: noProxy, no_proxy: noProxy, SIMSITES_NO_PROXY_RERUN: "1" },
+  });
+  process.exit(r.status ?? 1);
+}
 
 // ---- args ------------------------------------------------------------------------------------
 
@@ -216,7 +234,7 @@ const writeJsonFile = (f, v) => {
 function engineFiles(dir) {
   const found = {};
   for (const rel of walkFiles(dir))
-    if (/^(sims|references|style)\/|^[\w.-]+\.(md|html|css)$/.test(rel) && !rel.split("/").some((part) => part.startsWith(".")) && !/^sims\/[^/]+\/(meta\.json|chat\.jsonl)$/.test(rel) && !ENGINE_DOCS.includes(rel) && rel !== "brief.md")
+    if (/^(sims|references|style)\/|^[\w.-]+\.(md|html|css)$/.test(rel) && !LOCAL_ONLY.test(rel) && !rel.split("/").some((part) => part.startsWith(".")) && !/^sims\/[^/]+\/(meta\.json|chat\.jsonl)$/.test(rel) && !ENGINE_DOCS.includes(rel) && rel !== "brief.md")
       found[rel] = statSync(path.join(dir, rel)).size;
   return found;
 }
@@ -295,7 +313,13 @@ async function apiFetch(method, p, body, init) {
   const project = engineRequest(method, p, body);
   if (project && (await usesEngine()))
     // Not a network error: say what failed here instead of "SimSites isn't reachable".
-    return viaEngine(method, p, body, project).catch((err) => fail(`Rendering on this machine failed: ${err?.stack || err}`));
+    return viaEngine(method, p, body, project).catch((err) => {
+      const msg = String(err?.message || err);
+      if (process.env.SIMSITES_DEBUG) console.error(err?.stack || err);
+      fail(
+        `Rendering on this machine failed: ${msg.split("\n").slice(0, 6).join("\n")}${/missing dependencies|install-deps/i.test(msg) ? "\nOn Linux, install the browser's libraries once: sudo npx playwright@1.63.0 install-deps chromium" : ""}`,
+      );
+    });
   return studioFetch(p, init);
 }
 
@@ -307,7 +331,7 @@ async function api(method, p, body, { timeoutMs = 30000, soft = false } = {}) {
       const data = await res.json().catch(() => ({}));
       return res.ok ? data : { error: data.error || `HTTP ${res.status}` };
     } catch (err) {
-      return { error: err?.name === "TimeoutError" ? "the Studio did not answer in time" : "the Studio is not reachable" };
+      return { error: err?.name === "TimeoutError" ? "SimSites did not answer in time" : "SimSites is not reachable" };
     }
   }
   let res;
@@ -319,7 +343,7 @@ async function api(method, p, body, { timeoutMs = 30000, soft = false } = {}) {
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
-    if (err?.name === "TimeoutError") fail(`SimSites Studio did not answer in time (${p})`);
+    if (err?.name === "TimeoutError") fail(`SimSites did not answer in time (${p}). Try again in a moment.`);
     fail(`SimSites isn't reachable at ${studioUrl()}. Check your connection (or SIMSITES_URL).`);
   }
   const text = await res.text();
@@ -330,7 +354,12 @@ async function api(method, p, body, { timeoutMs = 30000, soft = false } = {}) {
     data = { error: text.slice(0, 300) };
   }
   if (res.status === 401)
-    fail(`${data.error || "Not signed in."} Make a token in ${studioUrl()}/settings, then: simsites auth <token>`);
+    fail(`${data.error || "Not signed in."} Make a new token on ${studioUrl()} ("Create token and copy command", or Settings → CLI tokens) and paste the line it copies into Claude Code.`);
+  // A feature SimSites doesn't know (put away, someone else's, or a typo): say which, and where to look.
+  if (res.status === 404 && p.endsWith("/restore")) fail(`SimSites has no feature "${p.split("/")[3]}" of yours to bring back. simsites list shows this repo's features.`);
+  const missing = res.status === 404 && data.error === "Not found" && p.match(/^\/api\/projects\/([a-z0-9][a-z0-9-]*)/)?.[1];
+  if (missing)
+    fail(`SimSites has no feature "${missing}" you can open. If it was put away (simsites cancel), bring it back with simsites restore --project ${missing}. Otherwise it's someone else's: simsites list shows this repo's features.`);
   if (!res.ok) fail(data.error || `HTTP ${res.status}`);
   return data;
 }
@@ -367,7 +396,8 @@ async function ensureStudio() {
   const h = await health();
   if (!h) fail(`SimSites isn't reachable at ${studioUrl()}. Check your connection (or SIMSITES_URL).`);
   if (!h.features?.includes("repo-0.5")) fail(`The SimSites at ${studioUrl()} is older than this plugin. Update it, or point the CLI at another one (simsites auth <token> --url …).`);
-  if (h.hosted && !studioToken()) fail(`Sign in to SimSites first: make a token at ${studioUrl()}/settings, then run: simsites auth <token>`);
+  if (h.hosted && !studioToken())
+    fail(`Sign in to SimSites first: open ${studioUrl()}, click "Create token and copy command" (or Settings → CLI tokens), and paste the line it copies into Claude Code.`);
 }
 
 // ---- git: what links a feature to its repo, branch and commits on GitHub -------------------------------------------
@@ -403,7 +433,11 @@ const sha1 = (buf) => createHash("sha1").update(buf).digest("hex");
  * Files of the design folder that live on SimSites: scenes and takes, style, the app's screenshots and notes. Not
  * what look writes (look/, history/ — they come down after a look), nor this CLI's own state.
  */
+// Claude's own before/after sheets, made again at every look: nothing on SimSites shows them, so they stay here.
+const LOCAL_ONLY = /^sims\/[^/]+\/look\/(compare|previous)(-mobile)?\.jpg$/;
+
 const SYNCED = (rel) =>
+  !LOCAL_ONLY.test(rel) &&
   /^(sims\/[a-z0-9][a-z0-9-]*\/[^/]+|style\/.+|references\/[^/]+|[\w.-]+\.(html|css))$/.test(rel) &&
   !rel.split("/").some((part) => part.startsWith(".")) &&
   !/^sims\/[^/]+\/(looked\.html|meta\.json|chat\.jsonl)$/.test(rel) &&
@@ -470,11 +504,19 @@ async function syncDesign(p, { quiet = false } = {}) {
     else if (r && r !== b) down.push(rel);
     else if (l) next[rel] = l; // removed there, unchanged here: keep it
   }
-  for (const rel of up) {
-    const body = readFileSync(path.join(dir, rel));
-    await upload(p, rel, body);
-    next[rel] = sha1(body);
-  }
+  // A request to the hosted SimSites carries at most ~4.5 MB: a bigger file stays here only (said once), instead of
+  // failing every command after it. Six at a time.
+  const tooBig = [];
+  for (let i = 0; i < up.length; i += 6)
+    await Promise.all(
+      up.slice(i, i + 6).map(async (rel) => {
+        const body = readFileSync(path.join(dir, rel));
+        if (body.length > 4 * 1024 * 1024) tooBig.push(rel);
+        else await upload(p, rel, body);
+        next[rel] = sha1(body);
+      }),
+    );
+  if (tooBig.length && !JSON_OUT) progress(`too big for SimSites (over 4 MB), kept on this computer only: ${tooBig.join(", ")}`);
   for (const rel of down) {
     const body = await download(p, rel);
     if (!body) continue;
@@ -564,9 +606,15 @@ async function loadPlaywright() {
     mkdirSync(runner, { recursive: true });
     if (!existsSync(path.join(runner, "package.json"))) writeFileSync(path.join(runner, "package.json"), '{ "private": true }\n');
     try {
-      execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "playwright@1.63.0"], { cwd: runner, stdio: ["ignore", "ignore", "inherit"] });
-    } catch {
-      fail(`Installing Playwright failed. Install it yourself: cd ${runner} && npm install playwright@1.63.0`);
+      // Windows: npm is npm.cmd, which Node only runs through a shell.
+      execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "playwright@1.63.0"], {
+        cwd: runner,
+        stdio: ["ignore", "ignore", "inherit"],
+        shell: process.platform === "win32",
+      });
+    } catch (err) {
+      if (err?.code === "ENOENT") fail("npm wasn't found (it comes with Node.js). Install Node 20+ from nodejs.org, or set SIMSITES_PLAYWRIGHT_DIR to a folder where playwright@1.63.0 is installed.");
+      fail(`Installing Playwright failed (${err?.message?.split("\n")[0] ?? err}). Install it yourself: in the folder ${runner}, run npm install playwright@1.63.0`);
     }
     pw = from(runner);
     if (!pw) fail(`Playwright isn't loadable from ${runner}.`);
@@ -581,7 +629,9 @@ async function loadPlaywright() {
     try {
       execFileSync(process.execPath, [createRequire(path.join(runner, "package.json")).resolve("playwright/cli.js"), "install", "chromium"], { stdio: ["ignore", "ignore", "inherit"] });
     } catch {
-      fail("Downloading Chromium failed. Run: npx playwright install chromium");
+      fail(
+        `Downloading Chromium failed. Run: npx playwright@1.63.0 install chromium${process.platform === "linux" ? " (and on Linux, if it says libraries are missing: sudo npx playwright@1.63.0 install-deps chromium)" : ""}`,
+      );
     }
   }
   return pw;
@@ -659,7 +709,8 @@ async function findRunningDevServer(detected) {
     if (port === studioPort) continue;
     try {
       const res = await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok && (res.headers.get("content-type") ?? "").includes("text/html")) return `http://localhost:${port}`;
+      // A page behind a sign-in (401, a redirect to /login) or a missing / is still the app.
+      if (res.status < 500 && (res.headers.get("content-type") ?? "").includes("text/html")) return `http://localhost:${port}`;
     } catch {}
   }
   return null;
@@ -773,8 +824,8 @@ function printSummary(s) {
     out(`  ${(STATUS[u.status] ?? u.status).padEnd(20)} ${u.title} ${c.dim(u.id)} ${extra}`);
   }
   if (s.plan) out(c.dim(`\n${s.plan.scope} feature — ${s.plan.reason}`));
-  if (s.assumptions?.length) out(c.dim(`\n${s.assumptions.length} decisions and assumptions — change them in the Studio (Details on the watch page)`));
-  if (s.inbox?.length) out(c.yellow(`\n${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"} from the Studio waiting — simsites inbox`));
+  if (s.assumptions?.length) out(c.dim(`\n${s.assumptions.length} decisions and assumptions — change them on the watch page (Details)`));
+  if (s.inbox?.length) out(c.yellow(`\n${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"} from the watch page waiting — simsites inbox`));
 }
 
 // ---- commands --------------------------------------------------------------------------------
@@ -785,7 +836,6 @@ const commands = {
 
 Setup
   simsites auth <token> [--url URL]    sign this computer in to SimSites (token from its settings page)
-  simsites push [--replace]            import a feature designed with an old local Studio into SimSites
   simsites init [--dev-url URL] [--routes /,/settings] [--reset-command CMD]
                                        link this repo (detects dev URL and routes)
 
@@ -806,7 +856,7 @@ Design a feature in Claude Code (you draw the sims; SimSites renders and checks 
   simsites show <sim> --labels [--at s]  a frame with numbered badges on every element + legend ("make #3 bigger")
   simsites undo <sim>                 back to the version before the last change
   simsites sims                       sims with status, check score and open comments
-  simsites inbox [--done c1,c2]        comments from the Studio waiting for you
+  simsites inbox [--done c1,c2]        comments from the watch page waiting for you
   simsites recapture                   capture the app's screens again
   simsites pull                        bring this feature's design folder in step with SimSites (another computer)
 
@@ -820,12 +870,14 @@ Review and approve (the user, on the watch page — or in the conversation)
   simsites status [--watch]            sims, approvals, assumptions, comments waiting
   simsites list · simsites use <id>    this repo's features / switch the current one
   simsites cancel [--project <id>]     put a feature away
+  simsites restore --project <id>      bring a feature that was put away back
   simsites login [/path]               sign in to your app once; capture and verify then run signed in
-  simsites version                     the plugin version and the Studio it talks to
+  simsites version                     the plugin version and the SimSites it talks to
+  simsites doctor                      check this computer's setup, with the fix for anything missing
 
 Build it
   simsites handoff [--drafts]          write approved sims + BUILD.md into .simsites/<feature>/
-  simsites progress "<note>"           tell the Studio what you're doing while you build
+  simsites progress "<note>"           tell the watch page what you're doing while you build
   simsites verify [--all]              replay every approved flow against your dev server (--all: every feature)
   simsites fixes [--done <id>]         the reviewer's fix requests (comments on built-vs-approved pairs)
 
@@ -922,7 +974,7 @@ Build it
     writeFileSync(CREDENTIALS, JSON.stringify({ ...readJson(CREDENTIALS, {}), [studioUrl()]: token }, null, 2) + "\n", { mode: 0o600 });
     installShortcut();
     if (JSON_OUT) return out(JSON.stringify({ ok: true, studioUrl: studioUrl(), login: me?.login ?? null }));
-    if (me) out(c.green("✓ ") + `Signed in to ${studioUrl()} as ${me.login}.`);
+    if (me) out(c.green("✓ ") + `Signed in to ${studioUrl()} as ${me.login}. Next: start your app's dev server, then type /simsites <a feature you want>.`);
     else out(c.yellow("• ") + `Saved. ${studioUrl()} didn't answer, so the token isn't checked yet.`);
   },
 
@@ -973,12 +1025,27 @@ Build it
     const cfg = repoConfig() ?? {};
     const features = (cfg.features ?? []).filter((f) => f !== p);
     saveRepo({ features, current: cfg.current === p ? (features.at(-1) ?? null) : cfg.current });
-    out(JSON_OUT ? JSON.stringify({ ok: true, cancelled: p }) : c.green("✓ ") + `Put ${p} away. (The Studio keeps it in workspace/.trash.)`);
+    out(JSON_OUT ? JSON.stringify({ ok: true, cancelled: p }) : c.green("✓ ") + `Put ${p} away. It no longer counts toward your plan.`);
+  },
+
+  /** Bring back a feature that was put away (hosted). */
+  async restore() {
+    const p = flags.project ? String(flags.project) : pos[0];
+    if (!p) fail("Which feature? simsites restore --project <id>");
+    await api("POST", `/api/projects/${p}/restore`);
+    const cfg = repoConfig() ?? {};
+    saveRepo({ features: [...new Set([...(cfg.features ?? []), p])], current: p });
+    out(JSON_OUT ? JSON.stringify({ ok: true, restored: p }) : c.green("✓ ") + `${p} is back.`);
   },
 
   async init() {
     const d = detectDev();
-    const prev = repoConfig() ?? {};
+    const prev = { ...(repoConfig() ?? {}) };
+    // A saved address that no longer answers is looked for again (the app moved ports since, or was guessed wrong).
+    if (!flags["dev-url"] && prev.devUrl && !(await fetch(prev.devUrl, { signal: AbortSignal.timeout(1500) }).then((r) => r.status < 500, () => false))) {
+      const running = await findRunningDevServer(prev.devUrl);
+      if (running) prev.devUrl = running;
+    }
     // The dev server may already run on another port than the default (e.g. 3000 was taken): use the one that answers.
     if (!flags["dev-url"] && !prev.devUrl) {
       const running = await findRunningDevServer(d.devUrl);
@@ -1257,13 +1324,17 @@ Object.assign(commands, {
     // --issue LIN-123 (or just "LIN-123" as the feature): the Linear issue is the brief.
     const issue = flags.issue ? String(flags.issue) : /^[A-Z][A-Z0-9]{0,9}-\d+$/.test(feature) ? feature : null;
     if (!feature && !issue) fail('Describe the feature: simsites design "Let admins invite teammates by email" (or --issue LIN-123)');
+    // Signed in first: nothing is written into the repo for a command that can't go on.
+    await ensureStudio();
     if (!repoConfig()) await commands.init.call(null, true);
     const cfg = repoConfig();
-    await ensureStudio();
     const mapRoutes = flags.map ? String(flags.map).split(",").map((r) => r.trim()).filter((r) => r.startsWith("/")) : null;
     const title = String(flags.title || (issue && feature === issue ? "" : feature.split(/[.\n]/)[0])).slice(0, 60);
-    if (!JSON_OUT) out(c.dim(`Capturing ${cfg.devUrl} (desktop and phone) …`));
     const hosted = await isHosted();
+    // The first time on a computer, Playwright and its browser are fetched (minutes): before the feature exists, so a
+    // run stopped part-way leaves nothing behind that counts toward the plan.
+    if (hosted) await loadPlaywright();
+    if (!JSON_OUT) out(c.dim(`Capturing ${cfg.devUrl} (desktop and phone) …`));
     const r = await api(
       "POST",
       "/api/projects",
@@ -1428,7 +1499,9 @@ Object.assign(commands, {
     }
     if (!process.env.SIMSITES_NO_OPEN && !flags["no-open"]) {
       try {
-        execFileSync(process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open", [url], { stdio: "ignore" });
+        // Windows: start is a shell command, run through cmd ("" is the window title it expects first).
+        if (process.platform === "win32") execFileSync("cmd", ["/c", "start", '""', url.replace(/&/g, "^&")], { stdio: "ignore" });
+        else execFileSync(process.platform === "darwin" ? "open" : "xdg-open", [url], { stdio: "ignore" });
       } catch {}
     }
     if (JSON_OUT) return out(JSON.stringify({ url, video }));
@@ -1592,8 +1665,8 @@ async function sessionHook() {
       const verified = existsSync(path.join(ROOT, ".simsites", id, "verify-report.json"));
       if (!films.length || (handedOff && verified && approved === films.length && !(s.inbox ?? []).length)) continue;
       const state = [
-        `${films.length} film${films.length === 1 ? "" : "s"}, ${approved} approved`,
-        (s.inbox ?? []).length ? `${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"} from the Studio waiting` : null,
+        `${films.length} sim${films.length === 1 ? "" : "s"}, ${approved} approved`,
+        (s.inbox ?? []).length ? `${s.inbox.length} comment${s.inbox.length === 1 ? "" : "s"} from the watch page waiting` : null,
         approved === films.length && !handedOff ? "approved but not built yet" : null,
         handedOff && !verified ? "handed off, not verified yet" : null,
       ].filter(Boolean);
@@ -1624,6 +1697,54 @@ commands.version = async () => {
   const health = await studioFetch(`/api/health`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json()).catch(() => null);
   out(`plugin ${pkg.version ?? "?"} (${path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")})`);
   out(health ? `SimSites ${studioUrl()} · ${health.features?.join(", ")}` : c.yellow(`SimSites didn't answer at ${studioUrl()}`));
+};
+
+/**
+ * `simsites doctor`: everything SimSites needs on this computer, one line each, with the fix for what's missing — for
+ * the user to paste when something doesn't work. Changes nothing.
+ */
+commands.doctor = async () => {
+  const lines = [];
+  const add = (ok, what, fix) => lines.push({ ok, what, ...(ok || !fix ? {} : { fix }) });
+  const pkg = readJson(path.join(PLUGIN_DIR, ".claude-plugin", "plugin.json"), {});
+  add(true, `plugin ${pkg.version ?? "?"} · ${process.platform} ${process.arch}`);
+  const major = Number(process.versions.node.split(".")[0]);
+  add(major >= 20, `Node ${process.version}`, "Install Node 20 or newer from nodejs.org.");
+  if (proxied) add(true, `proxy ${new URL(proxied).host} (used for SimSites; localhost stays direct)`);
+  const h = await health();
+  add(!!h, `SimSites at ${studioUrl()} ${h ? "answers" : "doesn't answer"}`, "Check the connection (or SIMSITES_URL / simsites auth --url).");
+  if (h?.hosted) {
+    const token = studioToken();
+    const me = token
+      ? await studioFetch("/api/me", { signal: AbortSignal.timeout(8000) }).then(async (r) => (r.ok ? r.json() : { error: (await r.json().catch(() => ({}))).error ?? `HTTP ${r.status}` }), () => ({ error: "no answer" }))
+      : null;
+    add(!!me?.login, me?.login ? `signed in as ${me.login} (${me.plan ?? "free"})` : token ? `the saved token isn't accepted: ${me?.error}` : "not signed in", `On ${studioUrl()}, click "Create token and copy command" (or Settings → CLI tokens) and paste the line into Claude Code.`);
+  }
+  const cfg = repoConfig();
+  add(!!cfg, cfg ? `this repo is linked (${path.basename(ROOT)})` : "this repo isn't linked yet", "simsites init (or just start with /simsites in Claude Code).");
+  if (cfg?.devUrl) {
+    const up = await fetch(cfg.devUrl, { signal: AbortSignal.timeout(3000), redirect: "manual" }).then((r) => r.status < 500, () => false);
+    add(up, `dev server ${cfg.devUrl} ${up ? "answers" : "doesn't answer"}`, `Start it (${cfg.devCommand ?? "your dev command"}), or point SimSites at the right address: simsites init --dev-url <url>.`);
+  }
+  const runner = path.join(HOME_DIR, "runner");
+  let pw = null;
+  try {
+    const { createRequire } = await import("node:module");
+    pw = createRequire(path.join(process.env.SIMSITES_PLAYWRIGHT_DIR || runner, "package.json"))("playwright");
+  } catch {}
+  let browser = null;
+  try {
+    browser = pw?.chromium.executablePath();
+    if (browser && !existsSync(browser)) browser = null;
+  } catch {}
+  if (!browser) {
+    const { findInstalledChromium } = await import(pathToFileURL(path.join(PLUGIN_DIR, "runner", "chromium.mjs")).href);
+    browser = findInstalledChromium() || null;
+  }
+  add(!!pw, pw ? "Playwright is installed" : "Playwright isn't installed yet", "Nothing to do: the first simsites design installs it (a few minutes, once).");
+  if (pw) add(!!browser, browser ? "a browser for capturing is there" : "no browser for capturing yet", "npx playwright@1.63.0 install chromium");
+  if (JSON_OUT) return out(JSON.stringify({ ok: lines.every((l) => l.ok), checks: lines }));
+  for (const l of lines) out(`${l.ok ? c.green("✓") : c.red("✗")} ${l.what}${l.fix ? c.dim(`\n    → ${l.fix}`) : ""}`);
 };
 
 // `simsites sims` = `simsites films` (sims were called films).
@@ -1697,14 +1818,14 @@ commands.hook = async () => {
       const newlyApproved = approved.filter((a) => !seen.approved.includes(a));
       if (inbox.length)
         notes.push(
-          `SimSites (${id}): ${inbox.length} request${inbox.length === 1 ? "" : "s"} from the Studio waiting for you:\n` +
+          `SimSites (${id}): ${inbox.length} request${inbox.length === 1 ? "" : "s"} from the watch page waiting for you:\n` +
             inbox.map((i) => `- ${i.id} [${i.sim ?? "feature"}${i.kind !== "comment" ? `, ${i.kind}${i.take ? ` ${i.take}` : ""}` : ""}]: ${i.text}`).join("\n") +
             `\nApply them after answering the user (simsites inbox --project ${id} shows where each points), then simsites look <sim> --note "…" --reply <ids>.`,
         );
       // The first look at a feature is the baseline: approvals before it were made in this conversation.
       if (newlyApproved.length && s.project.repo && !first) {
         const all = s.useCases.length > 0 && approved.length === s.useCases.length;
-        notes.push(`SimSites (${id}): approved in the Studio: ${newlyApproved.join(", ")}.${all ? ` Every sim is approved — build it (simsites handoff --project ${id}, then build it from the /simsites skill's build.md) unless the user says otherwise.` : ""}`);
+        notes.push(`SimSites (${id}): approved on the watch page: ${newlyApproved.join(", ")}.${all ? ` Every sim is approved — build it (simsites handoff --project ${id}, then build it from the /simsites skill's build.md) unless the user says otherwise.` : ""}`);
       }
       // Sims waiting for the user's decision: how they see them is the watch link, never GIFs in the chat.
       const waiting = s.useCases.filter((u) => u.hasScene && u.status !== "approved").length;
@@ -1746,7 +1867,7 @@ async function runVerify(p) {
       if (!b.report) fail("Verification finished without a report.");
       return b.report;
     }
-    if (Date.now() > deadline) fail("Verification is still running after 15 minutes — check the Studio's build page.");
+    if (Date.now() > deadline) fail("Verification is still running after 15 minutes — check the feature's build page on SimSites.");
   }
 }
 
@@ -1887,13 +2008,13 @@ async function waitForFixes(p) {
   const deadline = Date.now() + Number(flags.timeout || 3600) * 1000;
   const openIds = async () => new Set((await api("GET", `/api/projects/${p}/fixes`)).fixes.filter((f) => f.status === "open").map((f) => f.id));
   const known = await openIds();
-  progress(`waiting for fix requests from the Studio (${known.size} open)`);
+  progress(`waiting for fix requests from the watch page (${known.size} open)`);
   for (;;) {
     await new Promise((r) => setTimeout(r, 4000));
     // A slow or failed poll (a hosted SimSites' cold start) is retried, not the end of the wait.
     const r = await api("GET", `/api/projects/${p}/fixes`, undefined, { soft: true, timeoutMs: 60000 });
     if (r.error || !Array.isArray(r.fixes)) {
-      if (Date.now() > deadline) fail(`${r.error ?? "the Studio sent an unexpected answer"}.`);
+      if (Date.now() > deadline) fail(`${r.error ?? "SimSites sent an unexpected answer"}.`);
       continue;
     }
     const now = new Set(r.fixes.filter((f) => f.status === "open").map((f) => f.id));
@@ -1945,6 +2066,7 @@ async function repoWait(p) {
   // ?listening: the watch page tells the user that what they do there reaches Claude Code right away.
   const listening = `listening=1&device=${encodeURIComponent(deviceName())}${claudeSessionUrl() ? `&claude=${encodeURIComponent(claudeSessionUrl())}` : ""}`;
   let version;
+  let movedAt = Date.now();
   for (;;) {
     // Hosted: a cheap version check first; the summary only when something changed (or on the first round).
     if (version !== undefined) {
@@ -1952,17 +2074,22 @@ async function repoWait(p) {
       if (!st.error && typeof st.version === "string" && st.version === version) {
         if (Date.now() > deadline) version = undefined; // one last full look, which then times out
         else {
-          await new Promise((r) => setTimeout(r, 3000));
+          // Every 3s while things move, slower when nothing has for a while (under the 15s "listening" grace).
+          const idle = Date.now() - movedAt;
+          await new Promise((r) => setTimeout(r, idle < 120000 ? 3000 : idle < 600000 ? 6000 : 10000));
           continue;
         }
-      } else if (!st.error && typeof st.version === "string") version = st.version;
+      } else if (!st.error && typeof st.version === "string") {
+        version = st.version;
+        movedAt = Date.now();
+      }
     } else {
       const st = await api("GET", `/api/projects/${p}/status`, undefined, { soft: true, timeoutMs: 60000 });
       version = typeof st.version === "string" ? st.version : null; // null: a local Studio, no versions
     }
     let s = await api("GET", `/api/projects/${p}/summary?${listening}`, undefined, { soft: true, timeoutMs: 60000 });
     // A hosted SimSites can answer a cold start or a hiccup with something that isn't a summary: retry, don't crash.
-    if (!s.error && !Array.isArray(s.useCases)) s = { error: "the Studio sent an unexpected answer" };
+    if (!s.error && !Array.isArray(s.useCases)) s = { error: "SimSites sent an unexpected answer" };
     if (s.error) {
       if (s.error !== last) progress(`${s.error} — still waiting`);
       last = s.error;

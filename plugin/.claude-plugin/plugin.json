@@ -1,6 +1,6 @@
 {
   "name": "simsites",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Design a UI feature as short simulations (sims) of your app's real screens before building it: Claude draws them, you watch and approve them on one page (or refine them in the conversation), then Claude builds from the approved frames and verifies by replaying them in a real browser.",
   "author": {
     "name": "Yannick Erpelding"

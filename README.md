@@ -42,7 +42,7 @@ More: [CI](https://github.com/yannickErp/simsites-plugin/blob/main/plugin/action
 
 ## Version
 
-0.12.0. Needs Node 20+. Playwright installs itself into `~/.simsites/runner` the first time it's needed.
+0.13.0. Needs Node 20+. Playwright installs itself into `~/.simsites/runner` the first time it's needed.
 
 ## License
 

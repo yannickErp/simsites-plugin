@@ -1,5 +1,5 @@
 {
-  "description": "SimSites: at session start, features still in flight; at each message, comments and approvals made in the Studio since the last one; and no blocking approval questions while the watch page is the place to approve.",
+  "description": "SimSites: at session start, features still in flight; at each message, comments and approvals made on the watch page since the last one; and no blocking approval questions while the watch page is the place to approve.",
   "hooks": {
     "UserPromptSubmit": [
       {
