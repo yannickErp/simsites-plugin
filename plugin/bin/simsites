@@ -463,8 +463,14 @@ const encodeRel = (rel) => rel.split("/").map(encodeURIComponent).join("/");
 
 /** A feature file from SimSites (null when it isn't there). */
 async function download(p, rel) {
-  const res = await studioFetch(`/ws/${p}/${encodeRel(rel)}`, { signal: AbortSignal.timeout(60000) }).catch(() => null);
-  return res?.ok ? Buffer.from(await res.arrayBuffer()) : null;
+  // A dropped connection or a busy moment on SimSites shouldn't leave a storyboard missing: try twice more.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
+    const res = await studioFetch(`/ws/${p}/${encodeRel(rel)}`, { signal: AbortSignal.timeout(60000) }).catch(() => null);
+    if (res?.ok) return Buffer.from(await res.arrayBuffer());
+    if (res && [401, 403].includes(res.status)) return null;
+  }
+  return null;
 }
 
 async function upload(p, rel, body) {
