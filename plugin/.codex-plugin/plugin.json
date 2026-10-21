@@ -1,0 +1,26 @@
+{
+  "name": "simsites",
+  "version": "0.14.0",
+  "description": "Design a UI feature as short simulations (sims) of your app's real screens before building it: your agent draws them, you watch and approve them on one page (or refine them in the conversation), then it builds from the approved frames and verifies by replaying them in a real browser.",
+  "author": {
+    "name": "Yannick Erpelding"
+  },
+  "homepage": "https://simsites.vercel.app",
+  "repository": "https://github.com/yannickErp/simsites-plugin",
+  "keywords": ["simulation", "design", "e2e", "playwright", "spec"],
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json",
+  "interface": {
+    "displayName": "SimSites",
+    "shortDescription": "See, refine and approve a feature as short sims of your app before Codex builds it.",
+    "longDescription": "Codex draws your next feature as short simulations of your app's real screens. SimSites renders and checks them and plays them on a watch page where you and your team comment and approve. Codex then builds exactly what was approved, and every approved sim stays a test it replays against the running app.",
+    "developerName": "Y2 Labs",
+    "category": "Coding",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://simsites.vercel.app",
+    "defaultPrompt": [
+      "Use the simsites skill to design this feature as sims before building it: ",
+      "Use the verify skill to replay the approved SimSites sims against the running app."
+    ]
+  }
+}

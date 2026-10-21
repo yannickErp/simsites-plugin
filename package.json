@@ -1,0 +1,13 @@
+{
+  "name": "simsites",
+  "version": "0.14.0",
+  "private": true,
+  "description": "Design a UI feature as short simulations (sims) of your app's real screens before building it: Claude draws them, you watch and approve them on one page (or refine them in the conversation), then Claude builds from the approved frames and verifies by replaying them in a real browser.",
+  "bin": {
+    "simsites": "plugin/bin/simsites"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "SEE LICENSE IN LICENSE"
+}

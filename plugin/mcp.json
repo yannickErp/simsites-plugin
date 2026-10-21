@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "simsites": {
+      "command": "npx",
+      "args": ["-y", "github:yannickErp/simsites-plugin", "mcp"]
+    }
+  }
+}

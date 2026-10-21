@@ -17,6 +17,10 @@ sim's steps against the running app. SimSites (a website the `simsites` CLI talk
 and gives the developer the watch page where they see and approve each sim; the CLI captures the app and verifies
 the build on this machine.
 
+**Not in Claude Code (Codex, Cursor, another agent)?** The steps are the same; first call the `simsites_guide` tool of
+the `simsites` MCP server (it came with this plugin) once: it says how to run the CLI there (`simsites` may not be on
+your PATH; the MCP tool `simsites` runs any command), and what replaces AskUserQuestion, background waits and hooks.
+
 If no feature was given above and the conversation has none, ask what they want to build and stop.
 - A Linear issue id as the feature (`ENG-42`) → it's the brief: start with `simsites design --json --issue ENG-42` (add
   what you learnt from the code as the feature text if useful). "What's waiting?" → `simsites next` lists issues the team
@@ -159,7 +163,9 @@ compare the `before` storyboard `look` lists with the new one. Show the sheet to
   `simsites verify` on a clean checkout after your last commit (or the team's CI does it).
 - **Someone else should see it** (a PM, a designer, a client) → `simsites share` prints a link: anyone with it watches,
   comments and approves without an account (`--watch-only`: watch only). Teammates in the feature's team see it already.
-  Their comments and approvals reach you like the developer's, with their name.
+  Their comments and approvals reach you like the developer's, with their name. When the request came from someone
+  else (an issue's author, "the PM wants…", a client), say once, in one line, when you first show the sims: "Who asked
+  for this? `simsites share` makes them a link to approve it." — most features have someone who should see them.
 - **Watch / approve on SimSites** → the watch link (`simsites show <sim>` opens it; in an app with a preview/browser
   pane, open the URL there). `--video` also exports an MP4.
 - **The full Review page** (`simsites show --review`, under Details on the watch page): frame strip, Today vs Proposed, pointing

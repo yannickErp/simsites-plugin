@@ -72,7 +72,7 @@ function fail(msg, code = 1) {
  * SIMSITES_TELEMETRY=0 turns it off.
  */
 const STARTED = Date.now();
-const QUIET_COMMANDS = new Set(["hook", "help", "version", "auth"]);
+const QUIET_COMMANDS = new Set(["hook", "help", "version", "auth", "mcp"]);
 let reported = false;
 function reportRun(ok, error) {
   if (reported || QUIET_COMMANDS.has(cmd) || process.env.SIMSITES_TELEMETRY === "0") return;
@@ -886,6 +886,9 @@ Build it
   simsites progress "<note>"           tell the watch page what you're doing while you build
   simsites verify [--all]              replay every approved flow against your dev server (--all: every feature)
   simsites fixes [--done <id>]         the reviewer's fix requests (comments on built-vs-approved pairs)
+
+Other coding agents (Codex, Cursor, …)
+  simsites mcp                         serve these commands, and the method as a prompt, to an MCP client (stdio)
 
   Global: --project <id> (default: the current feature) · --json · --repo <path>`);
   },
@@ -2150,6 +2153,198 @@ async function repoWait(p) {
     return;
   }
 }
+
+// ---- other coding agents (Codex, Cursor, …): an MCP server over stdio ---------------------------------------------
+
+/*
+ * `simsites mcp`: the same CLI as tools, for agents without the Claude Code plugin (Codex, Cursor, any MCP client).
+ * No dependencies: newline-delimited JSON-RPC on stdin/stdout (the MCP stdio transport). Each tool call runs this CLI
+ * again as a child, so its output and exit code are exactly what a shell would see. The skill comes as a prompt.
+ */
+const MCP_CLI = fileURLToPath(import.meta.url);
+const shellCommand = `node "${MCP_CLI}"`;
+
+/** What an agent outside Claude Code needs to know before following the skill (written for it). */
+function otherAgentNotes() {
+  return `## You're not in Claude Code — read this first
+
+SimSites works the same in your agent; only these differ from the steps below:
+- **Commands:** where it says \`simsites <command> …\`, run it in your shell as \`${shellCommand} <command> …\` from the
+  app's repo (or call the \`simsites\` MCP tool with the same command and arguments). Prefer the shell for long ones
+  (the first \`design\` downloads a browser; \`look\`, \`verify\`): give them up to 10 minutes.
+- **Questions:** "AskUserQuestion" means: ask in plain text, at most 3 questions in one message, each with short options.
+- **Listening:** "in the background (run_in_background)" means a background shell job if you can run one. If you
+  can't, don't block on it: end your turn with the watch link, and when the user writes again, run
+  \`simsites wait --until decision --json --timeout 1\` (and \`simsites inbox\`) first to pick up what they did on the
+  watch page.
+- **Hooks:** the plugin's hooks don't run here, so notes starting with "SimSites (…):" won't appear: check
+  \`simsites inbox\` and \`simsites sims\` yourself when you resume a feature.
+- **Images:** read storyboards and frames (\`look/storyboard.jpg\`, \`look/compare.jpg\`) with your own file reader,
+  or the \`simsites_image\` MCP tool.
+- The skill's files (example-scene.html, patterns.md, build.md) are in ${path.join(PLUGIN_DIR, "skills", "simsites")}.
+`;
+}
+
+const skillBody = (name) => readFileSync(path.join(PLUGIN_DIR, "skills", name, "SKILL.md"), "utf8").replace(/^---\n[\s\S]*?\n---\n/, "");
+
+const MCP_TOOLS = [
+  {
+    name: "simsites",
+    title: "Run a SimSites command",
+    description:
+      "Run one `simsites` CLI command in the app's repo and return what it prints (stdout and stderr). Commands: design, look, show, coverage, sims, inbox, status, wait, approve (only on the user's explicit word), keep, undo, handoff, verify, fixes, share, list, use, init, login, recapture, pull, doctor, help. Before designing a feature, read the `simsites` prompt (or the `simsites_guide` tool): it is the whole method. Add --json for machine-readable output.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The command, e.g. \"design\", \"look\", \"verify\"" },
+        args: { type: "array", items: { type: "string" }, description: "Its arguments and flags, one per item, e.g. [\"invite-by-email\", \"--project\", \"team-invites\", \"--json\"]" },
+        repo: { type: "string", description: "Absolute path of the app's repo (default: the folder this server was started in)" },
+        timeout_seconds: { type: "number", description: "Give up after this long (default 300; up to 1800). `wait` returns after at most this long with reason \"timeout\": call it again." },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "simsites_guide",
+    title: "How to design a feature with SimSites",
+    description: "The SimSites method: how to draw sims of the app's real screens, check them, show them to the user, get them approved, then build and verify. Read it once before `simsites design`.",
+    inputSchema: { type: "object", properties: { part: { type: "string", enum: ["design", "build", "verify", "patterns"], description: "default: design" } } },
+  },
+  {
+    name: "simsites_image",
+    title: "Look at a SimSites image",
+    description: "Return an image SimSites wrote (a storyboard, a frame, a compare sheet: .jpg/.png/.gif under .simsites/), so you can look at it.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string", description: "The path `look` or `show` printed, e.g. .simsites/design/<id>/sims/<sim>/look/storyboard.jpg" }, repo: { type: "string" } },
+      required: ["path"],
+    },
+  },
+];
+
+const MCP_PROMPTS = [
+  { name: "simsites", title: "SimSites: design a feature", description: "Design a UI feature as short simulations of the app's real screens, get them approved, then build it.", arguments: [{ name: "feature", description: "The feature, in plain words", required: false }] },
+  { name: "simsites-verify", title: "SimSites: verify", description: "Replay every approved sim against the running app and fix what fails.", arguments: [] },
+];
+
+function mcpGuide(part = "design", feature = "") {
+  const dir = path.join(PLUGIN_DIR, "skills", "simsites");
+  if (part === "build") return readFileSync(path.join(dir, "build.md"), "utf8");
+  if (part === "patterns") return readFileSync(path.join(dir, "patterns.md"), "utf8");
+  if (part === "verify") return otherAgentNotes() + "\n" + skillBody("verify");
+  return otherAgentNotes() + "\n" + skillBody("simsites").replaceAll("$ARGUMENTS", feature || "(ask the user what they want to build)");
+}
+
+/** Runs the CLI as a child for one tool call. */
+function mcpRun({ command, args = [], repo, timeout_seconds }, cwd) {
+  const name = String(command ?? "").trim();
+  if (!/^[a-z][a-z-]*$/.test(name) || name === "mcp" || name === "hook") return Promise.resolve({ text: `Not a command: ${name || "(none)"}. Run "help" for the list.`, isError: true });
+  const limit = Math.min(Math.max(Number(timeout_seconds) || 300, 5), 1800);
+  const list = (Array.isArray(args) ? args : [args]).map(String);
+  // `wait` ends on its own before the call does, so the agent gets a "timeout" it can act on rather than an error.
+  if (name === "wait" && !list.some((a) => a === "--timeout" || a.startsWith("--timeout="))) list.push("--timeout", String(Math.max(limit - 5, 1)));
+  const root = repo ? path.resolve(String(repo)) : cwd;
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [MCP_CLI, name, ...list, "--repo", root], {
+      cwd: root,
+      env: { ...process.env, SIMSITES_NO_OPEN: process.env.SIMSITES_NO_OPEN ?? "1", NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    const timer = setTimeout(() => child.kill("SIGTERM"), limit * 1000);
+    child.on("error", (err) => resolve({ text: String(err?.message ?? err), isError: true }));
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      const text = [stdout.trim(), stderr.trim() && `--- stderr ---\n${stderr.trim()}`, signal && `(stopped after ${limit}s: run it in a shell with ${shellCommand} ${name} … for longer)`].filter(Boolean).join("\n\n");
+      resolve({ text: text || `(no output, exit code ${code})`, isError: code !== 0 });
+    });
+  });
+}
+
+function mcpImage({ path: file, repo }, cwd) {
+  const root = repo ? path.resolve(String(repo)) : cwd;
+  let abs = path.resolve(root, String(file ?? ""));
+  try {
+    abs = realpathSync(abs);
+  } catch {}
+  const type = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif" }[path.extname(abs).toLowerCase()];
+  // Only SimSites' own pictures: a tool call must not become a way to read any file.
+  if (!type || !abs.split(path.sep).includes(".simsites")) return { content: [{ type: "text", text: "Only .jpg, .png or .gif files under .simsites/ can be shown." }], isError: true };
+  if (!existsSync(abs)) return { content: [{ type: "text", text: `No such file: ${abs}` }], isError: true };
+  return { content: [{ type: "image", data: readFileSync(abs).toString("base64"), mimeType: type }] };
+}
+
+commands.mcp = async function mcp() {
+  const pkg = readJson(path.join(PLUGIN_DIR, ".claude-plugin", "plugin.json"), {});
+  const cwd = ROOT;
+  const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
+  const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
+  const error = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
+
+  async function handle(msg) {
+    const { id, method, params = {} } = msg;
+    if (id === undefined || id === null) return; // a notification (initialized, cancelled): nothing to answer
+    switch (method) {
+      case "initialize":
+        return reply(id, {
+          protocolVersion: params.protocolVersion || "2025-06-18",
+          capabilities: { tools: {}, prompts: {} },
+          serverInfo: { name: "simsites", title: "SimSites", version: pkg.version ?? "0" },
+          instructions: `SimSites: design a UI feature as short simulations (sims) of the app's real screens, get them approved on the watch page, then build exactly that and verify it. Before designing, read the "simsites" prompt or call simsites_guide. In a shell, the CLI is: ${shellCommand} <command>.`,
+        });
+      case "ping":
+        return reply(id, {});
+      case "tools/list":
+        return reply(id, { tools: MCP_TOOLS });
+      case "prompts/list":
+        return reply(id, { prompts: MCP_PROMPTS });
+      case "prompts/get": {
+        const text = params.name === "simsites-verify" ? mcpGuide("verify") : params.name === "simsites" ? mcpGuide("design", params.arguments?.feature) : null;
+        if (!text) return error(id, -32602, `No prompt named ${params.name}`);
+        return reply(id, { description: MCP_PROMPTS.find((p) => p.name === params.name).description, messages: [{ role: "user", content: { type: "text", text } }] });
+      }
+      case "tools/call": {
+        const a = params.arguments ?? {};
+        if (params.name === "simsites") {
+          const r = await mcpRun(a, cwd);
+          return reply(id, { content: [{ type: "text", text: r.text }], isError: r.isError });
+        }
+        if (params.name === "simsites_guide") return reply(id, { content: [{ type: "text", text: mcpGuide(a.part) }] });
+        if (params.name === "simsites_image") return reply(id, mcpImage(a, cwd));
+        return error(id, -32602, `No tool named ${params.name}`);
+      }
+      default:
+        return error(id, -32601, `Method not found: ${method}`);
+    }
+  }
+
+  let buffer = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    buffer += chunk;
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        error(null, -32700, "Parse error");
+        continue;
+      }
+      for (const m of Array.isArray(msg) ? msg : [msg])
+        handle(m).catch((err) => m.id != null && error(m.id, -32603, String(err?.message ?? err)));
+    }
+  });
+  // Serve until the client closes stdin.
+  await new Promise((resolve) => process.stdin.on("end", resolve));
+  process.exit(0);
+};
 
 // A bug in the CLI itself: say so plainly, and report it.
 for (const ev of ["uncaughtException", "unhandledRejection"])

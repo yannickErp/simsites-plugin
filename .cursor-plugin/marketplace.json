@@ -1,0 +1,16 @@
+{
+  "name": "simsites",
+  "owner": {
+    "name": "Yannick Erpelding"
+  },
+  "metadata": {
+    "description": "SimSites: simulate features of your app first, then build and verify them with your coding agent."
+  },
+  "plugins": [
+    {
+      "name": "simsites",
+      "source": "plugin",
+      "description": "Design a UI feature as short simulations (sims) of your app's real screens before building it, approve them on one page, then build from the approved frames and verify them in a real browser."
+    }
+  ]
+}

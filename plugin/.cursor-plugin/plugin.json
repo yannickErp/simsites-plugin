@@ -1,0 +1,15 @@
+{
+  "name": "simsites",
+  "displayName": "SimSites",
+  "version": "0.14.0",
+  "description": "Design a UI feature as short simulations (sims) of your app's real screens before building it: your agent draws them, you watch and approve them on one page (or refine them in the conversation), then it builds from the approved frames and verifies by replaying them in a real browser.",
+  "author": {
+    "name": "Yannick Erpelding"
+  },
+  "homepage": "https://simsites.vercel.app",
+  "repository": "https://github.com/yannickErp/simsites-plugin",
+  "keywords": ["simulation", "design", "e2e", "playwright", "spec"],
+  "category": "developer-tools",
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json"
+}
